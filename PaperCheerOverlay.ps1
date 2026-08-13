@@ -200,11 +200,12 @@ namespace PaperCheer {
             info.Size = Marshal.SizeOf(typeof(MONITORINFO));
             if (monitor == IntPtr.Zero || !GetMonitorInfo(monitor, ref info)) return false;
 
-            // The visible pet occupies the lower middle of Codex's mostly
-            // transparent overlay. Anchor to that sprite area, not to the
-            // full overlay rectangle.
-            int petLeft = target.Left + (int)Math.Round(targetWidth * 0.33);
-            int petRight = target.Left + (int)Math.Round(targetWidth * 0.67);
+            // Codex keeps the rendered pet and its controls in the lower-right
+            // portion of this otherwise transparent 408x400 overlay. Using a
+            // centered estimate makes a left-side bubble jump far away when
+            // the pet reaches the right edge of a monitor.
+            int petLeft = target.Left + (int)Math.Round(targetWidth * 0.77);
+            int petRight = target.Left + (int)Math.Round(targetWidth * 0.92);
             int petTop = target.Top + (int)Math.Round(targetHeight * 0.62);
             int petBottom = target.Top + (int)Math.Round(targetHeight * 0.90);
             int petCenterX = (petLeft + petRight) / 2;
