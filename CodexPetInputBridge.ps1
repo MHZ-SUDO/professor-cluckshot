@@ -55,6 +55,9 @@ public static class ProfessorCluckshotInputNative
     [DllImport("user32.dll", EntryPoint = "GetWindowLongPtrW")]
     public static extern IntPtr GetWindowLongPtr(IntPtr hwnd, int index);
 
+    [DllImport("user32.dll", EntryPoint = "SetWindowLongPtrW", SetLastError = true)]
+    public static extern IntPtr SetWindowLongPtr(IntPtr hwnd, int index, IntPtr value);
+
     [DllImport("user32.dll")]
     public static extern bool PostMessage(IntPtr hwnd, uint message, IntPtr wParam, IntPtr lParam);
 
@@ -165,6 +168,41 @@ function Send-OverlayMouseMove {
     )
 }
 
+function Test-PetControlZone {
+    param($Snapshot)
+
+    if ($null -eq $Snapshot -or -not $Snapshot.cursorInside) {
+        return $false
+    }
+
+    $localX = $Snapshot.cursorX - $Snapshot.left
+    $localY = $Snapshot.cursorY - $Snapshot.top
+    return $localX -ge [Math]::Round($Snapshot.width * 0.10) -and
+        $localX -le [Math]::Round($Snapshot.width * 0.90) -and
+        $localY -ge [Math]::Round($Snapshot.height * 0.45) -and
+        $localY -lt $Snapshot.height
+}
+
+function Set-OverlayTransparent {
+    param(
+        [IntPtr]$Overlay,
+        [bool]$Enabled
+    )
+
+    if ($Overlay -eq [IntPtr]::Zero -or -not [ProfessorCluckshotInputNative]::IsWindow($Overlay)) {
+        return $false
+    }
+
+    $style = [ProfessorCluckshotInputNative]::GetWindowLongPtr($Overlay, -20).ToInt64()
+    $desired = if ($Enabled) { $style -bor 0x20 } else { $style -band (-bnot 0x20) }
+    if ($desired -eq $style) {
+        return $false
+    }
+
+    [void][ProfessorCluckshotInputNative]::SetWindowLongPtr($Overlay, -20, [IntPtr]::new($desired))
+    return $true
+}
+
 if ($ProbeOnly) {
     $overlay = [ProfessorCluckshotInputNative]::FindOverlay()
     $snapshot = Get-OverlaySnapshot -Overlay $overlay
@@ -174,6 +212,7 @@ if ($ProbeOnly) {
         width = if ($null -ne $snapshot) { $snapshot.width } else { $null }
         height = if ($null -ne $snapshot) { $snapshot.height } else { $null }
         cursorInside = if ($null -ne $snapshot) { $snapshot.cursorInside } else { $false }
+        cursorInControlZone = Test-PetControlZone -Snapshot $snapshot
         transparent = if ($null -ne $snapshot) { $snapshot.transparent } else { $null }
         wouldPostWakeMessage = $null -ne $snapshot -and $snapshot.cursorInside -and $snapshot.transparent
     } | ConvertTo-Json -Compress
@@ -196,6 +235,8 @@ try {
 
     $overlay = [IntPtr]::Zero
     $lastLookup = [DateTime]::MinValue
+    $forcedInteractive = $false
+    $forcedOverlay = [IntPtr]::Zero
 
     while ($true) {
         if ($overlay -eq [IntPtr]::Zero -or -not [ProfessorCluckshotInputNative]::IsWindow($overlay)) {
@@ -207,16 +248,33 @@ try {
 
         $snapshot = Get-OverlaySnapshot -Overlay $overlay
         if ($null -eq $snapshot) {
+            $forcedInteractive = $false
+            $forcedOverlay = [IntPtr]::Zero
             $overlay = [IntPtr]::Zero
             Start-Sleep -Milliseconds 100
             continue
         }
 
+        $inControlZone = Test-PetControlZone -Snapshot $snapshot
+        if ($inControlZone) {
+            if ($snapshot.transparent -and (Set-OverlayTransparent -Overlay $overlay -Enabled $false)) {
+                $forcedInteractive = $true
+                $forcedOverlay = $overlay
+            }
+        } elseif ($forcedInteractive -and $forcedOverlay -eq $overlay) {
+            [void](Set-OverlayTransparent -Overlay $overlay -Enabled $true)
+            $forcedInteractive = $false
+            $forcedOverlay = [IntPtr]::Zero
+        }
+
         [void](Send-OverlayMouseMove -Snapshot $snapshot)
-        Start-Sleep -Milliseconds 25
+        Start-Sleep -Milliseconds 15
     }
 }
 finally {
+    if ($forcedInteractive -and $forcedOverlay -ne [IntPtr]::Zero) {
+        [void](Set-OverlayTransparent -Overlay $forcedOverlay -Enabled $true)
+    }
     if ($ownsMutex) {
         $mutex.ReleaseMutex()
     }
