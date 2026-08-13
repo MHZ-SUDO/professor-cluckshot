@@ -209,7 +209,7 @@ namespace PaperCheer {
             int petBottom = target.Top + (int)Math.Round(targetHeight * 0.90);
             int petCenterX = (petLeft + petRight) / 2;
             int petCenterY = (petTop + petBottom) / 2;
-            const int gap = 8;
+            const int gap = 2;
             const int margin = 8;
 
             int[,] candidates = new int[,] {
