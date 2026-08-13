@@ -31,6 +31,15 @@ public static class ProfessorCluckshotInputNative
         public int Y;
     }
 
+    [StructLayout(LayoutKind.Sequential)]
+    public struct MONITORINFO
+    {
+        public int Size;
+        public RECT Monitor;
+        public RECT Work;
+        public uint Flags;
+    }
+
     [DllImport("user32.dll")]
     public static extern bool EnumWindows(EnumWindowsProc callback, IntPtr lParam);
 
@@ -89,6 +98,38 @@ public static class ProfessorCluckshotInputNative
 
     [DllImport("user32.dll")]
     public static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint processId);
+
+    [DllImport("user32.dll")]
+    public static extern IntPtr MonitorFromWindow(IntPtr hwnd, uint flags);
+
+    [DllImport("user32.dll")]
+    public static extern bool GetMonitorInfo(IntPtr monitor, ref MONITORINFO info);
+
+    public static bool GetPetHorizontalBand(IntPtr overlay, out double leftFraction, out double rightFraction)
+    {
+        leftFraction = 0.42;
+        rightFraction = 0.58;
+
+        RECT rect;
+        if (!GetWindowRect(overlay, out rect)) return false;
+        IntPtr monitor = MonitorFromWindow(overlay, 2);
+        MONITORINFO info = new MONITORINFO();
+        info.Size = Marshal.SizeOf(typeof(MONITORINFO));
+        if (monitor == IntPtr.Zero || !GetMonitorInfo(monitor, ref info)) return false;
+
+        const int edgeTolerance = 24;
+        if (rect.Left <= info.Work.Left + edgeTolerance)
+        {
+            leftFraction = 0.06;
+            rightFraction = 0.22;
+        }
+        else if (rect.Right >= info.Work.Right - edgeTolerance)
+        {
+            leftFraction = 0.77;
+            rightFraction = 0.92;
+        }
+        return true;
+    }
 
     public static IntPtr FindOverlay()
     {
@@ -191,6 +232,13 @@ function Get-OverlaySnapshot {
     $transparent = ($extendedStyle -band 0x20) -ne 0
     [uint32]$ownerProcessId = 0
     [void][ProfessorCluckshotInputNative]::GetWindowThreadProcessId($Overlay, [ref]$ownerProcessId)
+    [double]$petBandLeft = 0.42
+    [double]$petBandRight = 0.58
+    [void][ProfessorCluckshotInputNative]::GetPetHorizontalBand(
+        $Overlay,
+        [ref]$petBandLeft,
+        [ref]$petBandRight
+    )
 
     [pscustomobject]@{
         overlay = $Overlay
@@ -205,6 +253,9 @@ function Get-OverlaySnapshot {
         extendedStyle = $extendedStyle
         transparent = [bool]$transparent
         layered = [bool](($extendedStyle -band 0x80000) -ne 0)
+        noActivate = [bool](($extendedStyle -band 0x8000000) -ne 0)
+        petBandLeft = $petBandLeft
+        petBandRight = $petBandRight
     }
 }
 
@@ -234,8 +285,8 @@ function Test-PetControlZone {
 
     $localX = $Snapshot.cursorX - $Snapshot.left
     $localY = $Snapshot.cursorY - $Snapshot.top
-    return $localX -ge [Math]::Round($Snapshot.width * 0.10) -and
-        $localX -le [Math]::Round($Snapshot.width * 0.90) -and
+    return $localX -ge [Math]::Round($Snapshot.width * [Math]::Max(0.0, $Snapshot.petBandLeft - 0.06)) -and
+        $localX -le [Math]::Round($Snapshot.width * [Math]::Min(1.0, $Snapshot.petBandRight + 0.06)) -and
         $localY -ge [Math]::Round($Snapshot.height * 0.45) -and
         $localY -lt $Snapshot.height
 }
@@ -249,10 +300,25 @@ function Test-PetButtonZone {
 
     $localX = $Snapshot.cursorX - $Snapshot.left
     $localY = $Snapshot.cursorY - $Snapshot.top
-    return $localX -ge [Math]::Round($Snapshot.width * 0.55) -and
-        $localX -le [Math]::Round($Snapshot.width * 0.82) -and
-        $localY -ge [Math]::Round($Snapshot.height * 0.83) -and
+    return $localX -ge [Math]::Round($Snapshot.width * [Math]::Max(0.0, $Snapshot.petBandLeft - 0.04)) -and
+        $localX -le [Math]::Round($Snapshot.width * [Math]::Min(1.0, $Snapshot.petBandRight + 0.04)) -and
+        $localY -ge [Math]::Round($Snapshot.height * 0.90) -and
         $localY -lt $Snapshot.height
+}
+
+function Test-PetBodyZone {
+    param($Snapshot)
+
+    if ($null -eq $Snapshot -or -not $Snapshot.cursorInside) {
+        return $false
+    }
+
+    $localX = $Snapshot.cursorX - $Snapshot.left
+    $localY = $Snapshot.cursorY - $Snapshot.top
+    return $localX -ge [Math]::Round($Snapshot.width * [Math]::Max(0.0, $Snapshot.petBandLeft - 0.02)) -and
+        $localX -le [Math]::Round($Snapshot.width * [Math]::Min(1.0, $Snapshot.petBandRight + 0.04)) -and
+        $localY -ge [Math]::Round($Snapshot.height * 0.62) -and
+        $localY -lt [Math]::Round($Snapshot.height * 0.90)
 }
 
 function Write-RelayState {
@@ -282,7 +348,8 @@ function Set-OverlayTransparent {
     param(
         [IntPtr]$Overlay,
         [bool]$Enabled,
-        [long]$ReferenceStyle = 0
+        [long]$ReferenceStyle = 0,
+        [bool]$NoActivate = $false
     )
 
     if ($Overlay -eq [IntPtr]::Zero -or -not [ProfessorCluckshotInputNative]::IsWindow($Overlay)) {
@@ -294,7 +361,12 @@ function Set-OverlayTransparent {
     # removing only WS_EX_TRANSPARENT still leaves layered-pixel hit testing
     # routing the round controls to the window underneath.
     $desired = if (-not $Enabled) {
-        ($style -band (-bnot 0x20)) -band (-bnot 0x80000)
+        $interactive = ($style -band (-bnot 0x20)) -band (-bnot 0x80000)
+        if ($NoActivate -or (($ReferenceStyle -band 0x8000000) -ne 0)) {
+            $interactive -bor 0x8000000
+        } else {
+            $interactive -band (-bnot 0x8000000)
+        }
     } else {
         $restored = $style
         $restored = if (($ReferenceStyle -band 0x20) -ne 0) {
@@ -306,6 +378,11 @@ function Set-OverlayTransparent {
             $restored -bor 0x80000
         } else {
             $restored -band (-bnot 0x80000)
+        }
+        $restored = if (($ReferenceStyle -band 0x8000000) -ne 0) {
+            $restored -bor 0x8000000
+        } else {
+            $restored -band (-bnot 0x8000000)
         }
         $restored
     }
@@ -337,8 +414,12 @@ if ($ProbeOnly) {
         cursorInside = if ($null -ne $snapshot) { $snapshot.cursorInside } else { $false }
         cursorInControlZone = Test-PetControlZone -Snapshot $snapshot
         cursorInButtonZone = Test-PetButtonZone -Snapshot $snapshot
+        cursorInBodyZone = Test-PetBodyZone -Snapshot $snapshot
         transparent = if ($null -ne $snapshot) { $snapshot.transparent } else { $null }
         layered = if ($null -ne $snapshot) { $snapshot.layered } else { $null }
+        noActivate = if ($null -ne $snapshot) { $snapshot.noActivate } else { $null }
+        petBandLeft = if ($null -ne $snapshot) { $snapshot.petBandLeft } else { $null }
+        petBandRight = if ($null -ne $snapshot) { $snapshot.petBandRight } else { $null }
         wouldPostWakeMessage = $null -ne $snapshot -and $snapshot.cursorInside -and $snapshot.transparent
     } | ConvertTo-Json -Compress
     exit 0
@@ -363,6 +444,7 @@ try {
     $forcedInteractive = $false
     $forcedOverlay = [IntPtr]::Zero
     $forcedOriginalStyle = 0
+    $baselineNormalized = $false
     $mouseWasDown = $false
     $syntheticClickPending = $false
     $syntheticDownX = 0
@@ -381,19 +463,28 @@ try {
             $forcedInteractive = $false
             $forcedOverlay = [IntPtr]::Zero
             $forcedOriginalStyle = 0
+            $baselineNormalized = $false
             $overlay = [IntPtr]::Zero
             Start-Sleep -Milliseconds 100
             continue
         }
 
         $inControlZone = Test-PetControlZone -Snapshot $snapshot
+        $inPetBody = Test-PetBodyZone -Snapshot $snapshot
+        $baselineStyle = (($snapshot.extendedStyle -bor 0x20) -bor 0x80000) -band (-bnot 0x8000000)
+        if (-not $baselineNormalized -and -not $inControlZone) {
+            [void](Set-OverlayTransparent -Overlay $overlay -Enabled $true -ReferenceStyle $baselineStyle)
+            $snapshot = Get-OverlaySnapshot -Overlay $overlay
+            $baselineNormalized = $true
+        }
         if ($inControlZone) {
             if (-not $forcedInteractive -or $forcedOverlay -ne $overlay) {
-                $forcedOriginalStyle = $snapshot.extendedStyle
+                $forcedOriginalStyle = $baselineStyle
+                $baselineNormalized = $true
                 $forcedInteractive = $true
                 $forcedOverlay = $overlay
             }
-            [void](Set-OverlayTransparent -Overlay $overlay -Enabled $false)
+            [void](Set-OverlayTransparent -Overlay $overlay -Enabled $false -ReferenceStyle $forcedOriginalStyle -NoActivate $inPetBody)
         } elseif ($forcedInteractive -and $forcedOverlay -eq $overlay) {
             [void](Set-OverlayTransparent -Overlay $overlay -Enabled $true -ReferenceStyle $forcedOriginalStyle)
             $forcedInteractive = $false
@@ -416,7 +507,7 @@ try {
             }
 
             if ($hitRoot -ne $overlay) {
-                [void](Set-OverlayTransparent -Overlay $overlay -Enabled $false)
+                [void](Set-OverlayTransparent -Overlay $overlay -Enabled $false -ReferenceStyle $forcedOriginalStyle)
                 $syntheticClickPending = $true
                 $syntheticDownX = $snapshot.cursorX
                 $syntheticDownY = $snapshot.cursorY
@@ -430,7 +521,7 @@ try {
                 [Math]::Pow($snapshot.cursorY - $syntheticDownY, 2)
             )
             if ($distance -lt 16 -and (Test-PetButtonZone -Snapshot $snapshot)) {
-                [void](Set-OverlayTransparent -Overlay $overlay -Enabled $false)
+                [void](Set-OverlayTransparent -Overlay $overlay -Enabled $false -ReferenceStyle $forcedOriginalStyle)
                 [ProfessorCluckshotInputNative]::mouse_event(0x0002, 0, 0, 0, [UIntPtr]::Zero)
                 Start-Sleep -Milliseconds 60
                 [ProfessorCluckshotInputNative]::mouse_event(0x0004, 0, 0, 0, [UIntPtr]::Zero)
