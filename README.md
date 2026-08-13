@@ -11,6 +11,7 @@ Professor Cluckshot is a basketball-loving research chicken for the Codex deskto
 - 默认每 3–7 分钟随机说话
 - 点击、悬停和拖动反馈
 - 修复语音按钮与收回箭头点击穿透
+- 说话气泡使用原生屏幕坐标贴近宠物，适配缩放和多显示器
 - 一键安装、登录自启动、状态诊断和卸载
 - 不依赖外部 AI、API 或聊天框
 
