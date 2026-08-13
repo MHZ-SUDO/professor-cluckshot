@@ -34,6 +34,9 @@ public static class ProfessorCluckshotInputNative
     [DllImport("user32.dll")]
     public static extern bool EnumWindows(EnumWindowsProc callback, IntPtr lParam);
 
+    [DllImport("user32.dll")]
+    public static extern bool EnumChildWindows(IntPtr parent, EnumWindowsProc callback, IntPtr lParam);
+
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     public static extern int GetClassName(IntPtr hwnd, StringBuilder text, int count);
 
@@ -52,6 +55,15 @@ public static class ProfessorCluckshotInputNative
     [DllImport("user32.dll")]
     public static extern bool GetCursorPos(out POINT point);
 
+    [DllImport("user32.dll")]
+    public static extern short GetAsyncKeyState(int virtualKey);
+
+    [DllImport("user32.dll")]
+    public static extern IntPtr WindowFromPoint(POINT point);
+
+    [DllImport("user32.dll")]
+    public static extern IntPtr GetAncestor(IntPtr hwnd, uint flags);
+
     [DllImport("user32.dll", EntryPoint = "GetWindowLongPtrW")]
     public static extern IntPtr GetWindowLongPtr(IntPtr hwnd, int index);
 
@@ -59,7 +71,21 @@ public static class ProfessorCluckshotInputNative
     public static extern IntPtr SetWindowLongPtr(IntPtr hwnd, int index, IntPtr value);
 
     [DllImport("user32.dll")]
+    public static extern bool SetWindowPos(
+        IntPtr hwnd,
+        IntPtr insertAfter,
+        int x,
+        int y,
+        int width,
+        int height,
+        uint flags
+    );
+
+    [DllImport("user32.dll")]
     public static extern bool PostMessage(IntPtr hwnd, uint message, IntPtr wParam, IntPtr lParam);
+
+    [DllImport("user32.dll")]
+    public static extern void mouse_event(uint flags, uint dx, uint dy, uint data, UIntPtr extraInfo);
 
     [DllImport("user32.dll")]
     public static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint processId);
@@ -103,6 +129,24 @@ public static class ProfessorCluckshotInputNative
         }, IntPtr.Zero);
 
         return best;
+    }
+
+    public static IntPtr FindRenderer(IntPtr overlay)
+    {
+        IntPtr result = IntPtr.Zero;
+        EnumChildWindows(overlay, (hwnd, lParam) =>
+        {
+            var className = new StringBuilder(128);
+            GetClassName(hwnd, className, className.Capacity);
+            if (className.ToString() == "Chrome_RenderWidgetHostHWND")
+            {
+                result = hwnd;
+                return false;
+            }
+
+            return true;
+        }, IntPtr.Zero);
+        return result;
     }
 
     public static IntPtr MakeMouseLParam(int x, int y)
@@ -183,6 +227,44 @@ function Test-PetControlZone {
         $localY -lt $Snapshot.height
 }
 
+function Test-PetButtonZone {
+    param($Snapshot)
+
+    if ($null -eq $Snapshot -or -not $Snapshot.cursorInside) {
+        return $false
+    }
+
+    $localX = $Snapshot.cursorX - $Snapshot.left
+    $localY = $Snapshot.cursorY - $Snapshot.top
+    return $localX -ge [Math]::Round($Snapshot.width * 0.55) -and
+        $localX -le [Math]::Round($Snapshot.width * 0.82) -and
+        $localY -ge [Math]::Round($Snapshot.height * 0.83) -and
+        $localY -lt $Snapshot.height
+}
+
+function Write-RelayState {
+    param(
+        $Snapshot,
+        [IntPtr]$Renderer,
+        [IntPtr]$HitRoot
+    )
+
+    $statePath = Join-Path $PSScriptRoot 'codex-pet-input-bridge-state.json'
+    $state = [ordered]@{
+        relayedAt = (Get-Date).ToString('o')
+        localX = $Snapshot.cursorX - $Snapshot.left
+        localY = $Snapshot.cursorY - $Snapshot.top
+        renderer = $Renderer.ToInt64()
+        originalHitRoot = $HitRoot.ToInt64()
+        overlay = $Snapshot.overlay.ToInt64()
+    }
+    [System.IO.File]::WriteAllText(
+        $statePath,
+        ($state | ConvertTo-Json -Compress),
+        (New-Object System.Text.UTF8Encoding($false))
+    )
+}
+
 function Set-OverlayTransparent {
     param(
         [IntPtr]$Overlay,
@@ -194,12 +276,28 @@ function Set-OverlayTransparent {
     }
 
     $style = [ProfessorCluckshotInputNative]::GetWindowLongPtr($Overlay, -20).ToInt64()
-    $desired = if ($Enabled) { $style -bor 0x20 } else { $style -band (-bnot 0x20) }
+    # The pet overlay is both transparent and layered. On this Codex build,
+    # removing only WS_EX_TRANSPARENT still leaves layered-pixel hit testing
+    # routing the round controls to the window underneath.
+    $desired = if ($Enabled) {
+        $style -bor 0x20 -bor 0x80000
+    } else {
+        ($style -band (-bnot 0x20)) -band (-bnot 0x80000)
+    }
     if ($desired -eq $style) {
         return $false
     }
 
     [void][ProfessorCluckshotInputNative]::SetWindowLongPtr($Overlay, -20, [IntPtr]::new($desired))
+    [void][ProfessorCluckshotInputNative]::SetWindowPos(
+        $Overlay,
+        [IntPtr]::new(-1),
+        0,
+        0,
+        0,
+        0,
+        0x233
+    )
     return $true
 }
 
@@ -213,6 +311,7 @@ if ($ProbeOnly) {
         height = if ($null -ne $snapshot) { $snapshot.height } else { $null }
         cursorInside = if ($null -ne $snapshot) { $snapshot.cursorInside } else { $false }
         cursorInControlZone = Test-PetControlZone -Snapshot $snapshot
+        cursorInButtonZone = Test-PetButtonZone -Snapshot $snapshot
         transparent = if ($null -ne $snapshot) { $snapshot.transparent } else { $null }
         wouldPostWakeMessage = $null -ne $snapshot -and $snapshot.cursorInside -and $snapshot.transparent
     } | ConvertTo-Json -Compress
@@ -237,6 +336,10 @@ try {
     $lastLookup = [DateTime]::MinValue
     $forcedInteractive = $false
     $forcedOverlay = [IntPtr]::Zero
+    $mouseWasDown = $false
+    $syntheticClickPending = $false
+    $syntheticDownX = 0
+    $syntheticDownY = 0
 
     while ($true) {
         if ($overlay -eq [IntPtr]::Zero -or -not [ProfessorCluckshotInputNative]::IsWindow($overlay)) {
@@ -268,7 +371,45 @@ try {
         }
 
         [void](Send-OverlayMouseMove -Snapshot $snapshot)
-        Start-Sleep -Milliseconds 15
+
+        $leftButtonDown = (([int][ProfessorCluckshotInputNative]::GetAsyncKeyState(1) -band 0x8000) -ne 0)
+        if ($leftButtonDown -and -not $mouseWasDown -and (Test-PetButtonZone -Snapshot $snapshot)) {
+            $renderer = [ProfessorCluckshotInputNative]::FindRenderer($overlay)
+            $hit = [ProfessorCluckshotInputNative]::WindowFromPoint(
+                [ProfessorCluckshotInputNative+POINT]@{ X = $snapshot.cursorX; Y = $snapshot.cursorY }
+            )
+            $hitRoot = if ($hit -ne [IntPtr]::Zero) {
+                [ProfessorCluckshotInputNative]::GetAncestor($hit, 2)
+            } else {
+                [IntPtr]::Zero
+            }
+
+            if ($renderer -ne [IntPtr]::Zero -and $hitRoot -ne $overlay) {
+                [void](Set-OverlayTransparent -Overlay $overlay -Enabled $false)
+                $syntheticClickPending = $true
+                $syntheticDownX = $snapshot.cursorX
+                $syntheticDownY = $snapshot.cursorY
+                Write-RelayState -Snapshot $snapshot -Renderer $renderer -HitRoot $hitRoot
+            }
+        }
+
+        if (-not $leftButtonDown -and $mouseWasDown -and $syntheticClickPending) {
+            $distance = [Math]::Sqrt(
+                [Math]::Pow($snapshot.cursorX - $syntheticDownX, 2) +
+                [Math]::Pow($snapshot.cursorY - $syntheticDownY, 2)
+            )
+            if ($distance -lt 16 -and (Test-PetButtonZone -Snapshot $snapshot)) {
+                [void](Set-OverlayTransparent -Overlay $overlay -Enabled $false)
+                [ProfessorCluckshotInputNative]::mouse_event(0x0002, 0, 0, 0, [UIntPtr]::Zero)
+                Start-Sleep -Milliseconds 60
+                [ProfessorCluckshotInputNative]::mouse_event(0x0004, 0, 0, 0, [UIntPtr]::Zero)
+            }
+            $syntheticClickPending = $false
+        }
+
+        $mouseWasDown = $leftButtonDown
+        $pollDelayMilliseconds = if ($inControlZone) { 2 } else { 15 }
+        Start-Sleep -Milliseconds $pollDelayMilliseconds
     }
 }
 finally {

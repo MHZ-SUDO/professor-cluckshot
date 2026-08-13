@@ -54,7 +54,7 @@ Get-ChildItem -Filter *.ps1 | Unblock-File
 
 The final command starts both required Windows helpers:
 
-- `inputBridge` temporarily disables click-through over the pet and its round controls, so the voice and collapse buttons can receive single clicks, then restores click-through when the pointer leaves.
+- `inputBridge` temporarily disables transparent/layered hit testing over the pet controls and, if a click still reaches the window underneath, retries one native single click while the pet window is interactive.
 - `speechOverlay` provides the random dialogue bubble and click, hover, and drag reactions.
 
 Windows does not automatically execute PowerShell scripts downloaded from GitHub. Run `Start-PaperCheer.ps1` once after each Windows sign-in if you want the dialogue and input repair active for that session.
