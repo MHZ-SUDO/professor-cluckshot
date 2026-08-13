@@ -70,6 +70,9 @@ namespace PaperCheer {
         [DllImport("user32.dll", CharSet = CharSet.Unicode)]
         private static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int count);
 
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        private static extern int GetClassName(IntPtr hWnd, StringBuilder text, int count);
+
         [DllImport("user32.dll")]
         private static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
 
@@ -112,33 +115,49 @@ namespace PaperCheer {
         }
 
         public static bool TryGetCodexPetRect(out RECT result) {
-            RECT bestRect = new RECT();
-            int bestScore = Int32.MaxValue;
+            RECT bestPreferredRect = new RECT();
+            RECT bestFallbackRect = new RECT();
+            int bestPreferredScore = Int32.MaxValue;
+            int bestFallbackScore = Int32.MaxValue;
 
             EnumWindows(delegate(IntPtr hWnd, IntPtr lParam) {
                 if (!IsWindowVisible(hWnd)) return true;
 
                 StringBuilder title = new StringBuilder(256);
+                StringBuilder className = new StringBuilder(128);
                 GetWindowText(hWnd, title, title.Capacity);
+                GetClassName(hWnd, className, className.Capacity);
                 if (!String.Equals(title.ToString(), "Codex", StringComparison.Ordinal)) return true;
+                string windowClass = className.ToString();
+                if (windowClass != "Chrome_WidgetWin_1" && windowClass != "FLUTTERVIEW") return true;
 
                 RECT rect;
                 if (!GetWindowRect(hWnd, out rect)) return true;
 
                 int width = rect.Right - rect.Left;
                 int height = rect.Bottom - rect.Top;
-                if (width < 180 || width > 700 || height < 160 || height > 700) return true;
+                if (width < 120 || width > 1200 || height < 120 || height > 1200) return true;
 
-                int score = Math.Abs(width - 408) + Math.Abs(height - 400);
-                if (score < bestScore) {
-                    bestScore = score;
-                    bestRect = rect;
+                long style = GetWindowLongPtr(hWnd, GWL_EXSTYLE).ToInt64();
+                bool preferred = (style & 0x8L) != 0 && (style & WS_EX_TOOLWINDOW) != 0;
+                int score = (Math.Abs(width - height) * 4) + width + height;
+                if (preferred && score < bestPreferredScore) {
+                    bestPreferredScore = score;
+                    bestPreferredRect = rect;
+                }
+                if (score < bestFallbackScore) {
+                    bestFallbackScore = score;
+                    bestFallbackRect = rect;
                 }
                 return true;
             }, IntPtr.Zero);
 
-            result = bestRect;
-            return bestScore != Int32.MaxValue;
+            if (bestPreferredScore != Int32.MaxValue) {
+                result = bestPreferredRect;
+                return true;
+            }
+            result = bestFallbackRect;
+            return bestFallbackScore != Int32.MaxValue;
         }
     }
 }

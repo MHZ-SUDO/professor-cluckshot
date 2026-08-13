@@ -1,5 +1,7 @@
 # Runtime state
 paper-cheer-overlay.pid
+codex-pet-input-bridge.pid
+codex-pet-input-bridge-state.json
 paper-cheer-last-message.json
 paper-cheer-overlay-state.json
 paper-cheer-command.json
