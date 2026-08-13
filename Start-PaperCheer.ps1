@@ -117,6 +117,6 @@ $overlay = Start-Sidecar -ScriptPath $overlayScript -PidPath $overlayPidPath -St
     speechOverlay = $overlay
     minIntervalSeconds = $MinIntervalSeconds
     maxIntervalSeconds = $MaxIntervalSeconds
-    anchor = 'Codex 宠物覆盖层上方'
+    anchor = 'Codex 宠物旁边（原生像素定位）'
     bubbleClickThrough = $true
 } | ConvertTo-Json -Depth 4 -Compress

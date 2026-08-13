@@ -61,6 +61,14 @@ namespace PaperCheer {
             public int Y;
         }
 
+        [StructLayout(LayoutKind.Sequential)]
+        public struct MONITORINFO {
+            public int Size;
+            public RECT Monitor;
+            public RECT Work;
+            public uint Flags;
+        }
+
         [DllImport("user32.dll")]
         private static extern bool EnumWindows(EnumWindowsProc callback, IntPtr lParam);
 
@@ -75,6 +83,23 @@ namespace PaperCheer {
 
         [DllImport("user32.dll")]
         private static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr MonitorFromRect(ref RECT rect, uint flags);
+
+        [DllImport("user32.dll")]
+        private static extern bool GetMonitorInfo(IntPtr monitor, ref MONITORINFO info);
+
+        [DllImport("user32.dll")]
+        private static extern bool SetWindowPos(
+            IntPtr hWnd,
+            IntPtr insertAfter,
+            int x,
+            int y,
+            int width,
+            int height,
+            uint flags
+        );
 
         [DllImport("user32.dll")]
         public static extern bool GetCursorPos(out POINT point);
@@ -158,6 +183,69 @@ namespace PaperCheer {
             }
             result = bestFallbackRect;
             return bestFallbackScore != Int32.MaxValue;
+        }
+
+        public static bool PositionBubbleNearPet(IntPtr bubble, RECT target) {
+            RECT bubbleRect;
+            if (bubble == IntPtr.Zero || !GetWindowRect(bubble, out bubbleRect)) return false;
+
+            int bubbleWidth = bubbleRect.Right - bubbleRect.Left;
+            int bubbleHeight = bubbleRect.Bottom - bubbleRect.Top;
+            int targetWidth = target.Right - target.Left;
+            int targetHeight = target.Bottom - target.Top;
+            if (bubbleWidth <= 0 || bubbleHeight <= 0 || targetWidth <= 0 || targetHeight <= 0) return false;
+
+            IntPtr monitor = MonitorFromRect(ref target, 2);
+            MONITORINFO info = new MONITORINFO();
+            info.Size = Marshal.SizeOf(typeof(MONITORINFO));
+            if (monitor == IntPtr.Zero || !GetMonitorInfo(monitor, ref info)) return false;
+
+            // The visible pet occupies the lower middle of Codex's mostly
+            // transparent overlay. Anchor to that sprite area, not to the
+            // full overlay rectangle.
+            int petLeft = target.Left + (int)Math.Round(targetWidth * 0.33);
+            int petRight = target.Left + (int)Math.Round(targetWidth * 0.67);
+            int petTop = target.Top + (int)Math.Round(targetHeight * 0.62);
+            int petBottom = target.Top + (int)Math.Round(targetHeight * 0.90);
+            int petCenterX = (petLeft + petRight) / 2;
+            int petCenterY = (petTop + petBottom) / 2;
+            const int gap = 8;
+            const int margin = 8;
+
+            int[,] candidates = new int[,] {
+                { petRight + gap, petCenterY - (bubbleHeight / 2) },
+                { petLeft - gap - bubbleWidth, petCenterY - (bubbleHeight / 2) },
+                { petCenterX - (bubbleWidth / 2), petTop - gap - bubbleHeight },
+                { petCenterX - (bubbleWidth / 2), petBottom + gap }
+            };
+
+            int minX = info.Work.Left + margin;
+            int maxX = info.Work.Right - margin - bubbleWidth;
+            int minY = info.Work.Top + margin;
+            int maxY = info.Work.Bottom - margin - bubbleHeight;
+            int left = candidates[0, 0];
+            int top = candidates[0, 1];
+            bool found = false;
+            for (int i = 0; i < candidates.GetLength(0); i++) {
+                int x = candidates[i, 0];
+                int y = candidates[i, 1];
+                if (x >= minX && x <= maxX && y >= minY && y <= maxY) {
+                    left = x;
+                    top = y;
+                    found = true;
+                    break;
+                }
+            }
+
+            if (!found) {
+                left = Math.Max(minX, Math.Min(left, maxX));
+                top = Math.Max(minY, Math.Min(top, maxY));
+            }
+
+            // Win32 rectangles and SetWindowPos both use physical screen
+            // pixels, avoiding WPF DIP drift at 125%/150% scaling and on
+            // mixed-DPI multi-monitor desktops.
+            return SetWindowPos(bubble, new IntPtr(-1), left, top, 0, 0, 0x0011);
         }
     }
 }
@@ -405,6 +493,7 @@ $panel.Children.Add($ball) | Out-Null
 $panel.Children.Add($messageText) | Out-Null
 $border.Child = $panel
 $window.Content = $border
+$script:bubbleHandle = [IntPtr]::Zero
 
 function Update-BubblePosition {
     $virtualLeft = [System.Windows.SystemParameters]::VirtualScreenLeft
@@ -414,6 +503,12 @@ function Update-BubblePosition {
 
     $target = New-Object PaperCheer.NativeWindow+RECT
     if ([PaperCheer.NativeWindow]::TryGetCodexPetRect([ref]$target)) {
+        if ($script:bubbleHandle -ne [IntPtr]::Zero -and
+            [PaperCheer.NativeWindow]::PositionBubbleNearPet($script:bubbleHandle, $target)) {
+            return
+        }
+
+        # Startup-only fallback before the WPF handle is available.
         $targetHeight = $target.Bottom - $target.Top
         $rightSideLeft = $target.Right - 150
         $leftSideLeft = $target.Left - $window.Width + 150
@@ -642,7 +737,8 @@ $autoTimer.Add_Tick({
 
 $window.Add_SourceInitialized({
     $helper = New-Object System.Windows.Interop.WindowInteropHelper($window)
-    [PaperCheer.NativeWindow]::MakeClickThrough($helper.Handle)
+    $script:bubbleHandle = $helper.Handle
+    [PaperCheer.NativeWindow]::MakeClickThrough($script:bubbleHandle)
 })
 
 $window.Add_Closed({
