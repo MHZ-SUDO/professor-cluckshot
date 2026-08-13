@@ -92,8 +92,10 @@ public static class ProfessorCluckshotInputNative
 
     public static IntPtr FindOverlay()
     {
-        IntPtr best = IntPtr.Zero;
-        int bestScore = Int32.MaxValue;
+        IntPtr bestPreferred = IntPtr.Zero;
+        IntPtr bestFallback = IntPtr.Zero;
+        int bestPreferredScore = Int32.MaxValue;
+        int bestFallbackScore = Int32.MaxValue;
 
         EnumWindows((hwnd, lParam) =>
         {
@@ -103,7 +105,8 @@ public static class ProfessorCluckshotInputNative
             GetWindowText(hwnd, title, title.Capacity);
 
             RECT rect;
-            if (className.ToString() != "Chrome_WidgetWin_1" ||
+            string windowClass = className.ToString();
+            if ((windowClass != "Chrome_WidgetWin_1" && windowClass != "FLUTTERVIEW") ||
                 title.ToString() != "Codex" ||
                 !IsWindowVisible(hwnd) ||
                 !GetWindowRect(hwnd, out rect))
@@ -113,22 +116,29 @@ public static class ProfessorCluckshotInputNative
 
             int width = rect.Right - rect.Left;
             int height = rect.Bottom - rect.Top;
-            if (width < 180 || width > 700 || height < 180 || height > 700)
+            if (width < 120 || width > 1200 || height < 120 || height > 1200)
             {
                 return true;
             }
 
-            int score = Math.Abs(width - 408) + Math.Abs(height - 400);
-            if (score < bestScore)
+            long style = GetWindowLongPtr(hwnd, -20).ToInt64();
+            bool preferred = (style & 0x8L) != 0 && (style & 0x80L) != 0;
+            int score = (Math.Abs(width - height) * 4) + width + height;
+            if (preferred && score < bestPreferredScore)
             {
-                best = hwnd;
-                bestScore = score;
+                bestPreferred = hwnd;
+                bestPreferredScore = score;
+            }
+            if (score < bestFallbackScore)
+            {
+                bestFallback = hwnd;
+                bestFallbackScore = score;
             }
 
             return true;
         }, IntPtr.Zero);
 
-        return best;
+        return bestPreferred != IntPtr.Zero ? bestPreferred : bestFallback;
     }
 
     public static IntPtr FindRenderer(IntPtr overlay)
@@ -138,7 +148,8 @@ public static class ProfessorCluckshotInputNative
         {
             var className = new StringBuilder(128);
             GetClassName(hwnd, className, className.Capacity);
-            if (className.ToString() == "Chrome_RenderWidgetHostHWND")
+            string windowClass = className.ToString();
+            if (windowClass == "Chrome_RenderWidgetHostHWND" || windowClass == "FLUTTERVIEW")
             {
                 result = hwnd;
                 return false;
@@ -191,7 +202,9 @@ function Get-OverlaySnapshot {
         cursorX = if ($hasCursor) { $cursor.X } else { $null }
         cursorY = if ($hasCursor) { $cursor.Y } else { $null }
         cursorInside = [bool]$inside
+        extendedStyle = $extendedStyle
         transparent = [bool]$transparent
+        layered = [bool](($extendedStyle -band 0x80000) -ne 0)
     }
 }
 
@@ -268,7 +281,8 @@ function Write-RelayState {
 function Set-OverlayTransparent {
     param(
         [IntPtr]$Overlay,
-        [bool]$Enabled
+        [bool]$Enabled,
+        [long]$ReferenceStyle = 0
     )
 
     if ($Overlay -eq [IntPtr]::Zero -or -not [ProfessorCluckshotInputNative]::IsWindow($Overlay)) {
@@ -279,10 +293,21 @@ function Set-OverlayTransparent {
     # The pet overlay is both transparent and layered. On this Codex build,
     # removing only WS_EX_TRANSPARENT still leaves layered-pixel hit testing
     # routing the round controls to the window underneath.
-    $desired = if ($Enabled) {
-        $style -bor 0x20 -bor 0x80000
-    } else {
+    $desired = if (-not $Enabled) {
         ($style -band (-bnot 0x20)) -band (-bnot 0x80000)
+    } else {
+        $restored = $style
+        $restored = if (($ReferenceStyle -band 0x20) -ne 0) {
+            $restored -bor 0x20
+        } else {
+            $restored -band (-bnot 0x20)
+        }
+        $restored = if (($ReferenceStyle -band 0x80000) -ne 0) {
+            $restored -bor 0x80000
+        } else {
+            $restored -band (-bnot 0x80000)
+        }
+        $restored
     }
     if ($desired -eq $style) {
         return $false
@@ -313,6 +338,7 @@ if ($ProbeOnly) {
         cursorInControlZone = Test-PetControlZone -Snapshot $snapshot
         cursorInButtonZone = Test-PetButtonZone -Snapshot $snapshot
         transparent = if ($null -ne $snapshot) { $snapshot.transparent } else { $null }
+        layered = if ($null -ne $snapshot) { $snapshot.layered } else { $null }
         wouldPostWakeMessage = $null -ne $snapshot -and $snapshot.cursorInside -and $snapshot.transparent
     } | ConvertTo-Json -Compress
     exit 0
@@ -336,6 +362,7 @@ try {
     $lastLookup = [DateTime]::MinValue
     $forcedInteractive = $false
     $forcedOverlay = [IntPtr]::Zero
+    $forcedOriginalStyle = 0
     $mouseWasDown = $false
     $syntheticClickPending = $false
     $syntheticDownX = 0
@@ -353,6 +380,7 @@ try {
         if ($null -eq $snapshot) {
             $forcedInteractive = $false
             $forcedOverlay = [IntPtr]::Zero
+            $forcedOriginalStyle = 0
             $overlay = [IntPtr]::Zero
             Start-Sleep -Milliseconds 100
             continue
@@ -360,14 +388,17 @@ try {
 
         $inControlZone = Test-PetControlZone -Snapshot $snapshot
         if ($inControlZone) {
-            if ($snapshot.transparent -and (Set-OverlayTransparent -Overlay $overlay -Enabled $false)) {
+            if (-not $forcedInteractive -or $forcedOverlay -ne $overlay) {
+                $forcedOriginalStyle = $snapshot.extendedStyle
                 $forcedInteractive = $true
                 $forcedOverlay = $overlay
             }
+            [void](Set-OverlayTransparent -Overlay $overlay -Enabled $false)
         } elseif ($forcedInteractive -and $forcedOverlay -eq $overlay) {
-            [void](Set-OverlayTransparent -Overlay $overlay -Enabled $true)
+            [void](Set-OverlayTransparent -Overlay $overlay -Enabled $true -ReferenceStyle $forcedOriginalStyle)
             $forcedInteractive = $false
             $forcedOverlay = [IntPtr]::Zero
+            $forcedOriginalStyle = 0
         }
 
         [void](Send-OverlayMouseMove -Snapshot $snapshot)
@@ -384,7 +415,7 @@ try {
                 [IntPtr]::Zero
             }
 
-            if ($renderer -ne [IntPtr]::Zero -and $hitRoot -ne $overlay) {
+            if ($hitRoot -ne $overlay) {
                 [void](Set-OverlayTransparent -Overlay $overlay -Enabled $false)
                 $syntheticClickPending = $true
                 $syntheticDownX = $snapshot.cursorX
@@ -414,7 +445,7 @@ try {
 }
 finally {
     if ($forcedInteractive -and $forcedOverlay -ne [IntPtr]::Zero) {
-        [void](Set-OverlayTransparent -Overlay $forcedOverlay -Enabled $true)
+        [void](Set-OverlayTransparent -Overlay $forcedOverlay -Enabled $true -ReferenceStyle $forcedOriginalStyle)
     }
     if ($ownsMutex) {
         $mutex.ReleaseMutex()

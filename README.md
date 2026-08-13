@@ -1,136 +1,136 @@
 # Professor Cluckshot
 
-Professor Cluckshot is a basketball-loving research chicken for the Codex desktop app. He animates as a Codex v2 pet and occasionally drops a random thesis pep talk, a useful reminder, or a light meme.
+Professor Cluckshot 是 Codex 桌面端的论文鼓励宠物。它包含完整的 Codex v2 动画、中文随机台词、点击/悬停/拖动反馈，以及 Windows 下的圆形按钮点击修复。
 
-鸡哥现在有了英文艺名 `Professor Cluckshot`。它会在 Codex 桌面端活动，也会随机说一些论文鼓励、实验提醒、篮球梗和轻松调侃。
+Professor Cluckshot is a basketball-loving research chicken for the Codex desktop app, with a v2 animation atlas, conversational Chinese thesis encouragement, and Windows runtime helpers.
 
-## What it includes
+## 功能
 
-- A Codex v2 animated pet package with an 8 × 11, 1536 × 2288 WebP atlas
-- 243 hand-written Chinese lines
-- Dynamic sentence generation with more than 52,000 valid combinations
-- Automatic speech every 3–7 minutes by default
-- Click, hover, and drag reactions near the pet
-- A Windows input bridge that restores clicks on the voice and collapse buttons when the Codex pet overlay is temporarily click-through
-- Recent-line avoidance so the same phrases do not repeat too often
-- A compact click-through speech bubble that does not block the Codex controls
-- No chat box and no external AI or API dependency
+- Codex v2 宠物包：8 × 11、1536 × 2288、RGBA WebP
+- 243 条手写中文台词和超过 52,000 种动态组合
+- 默认每 3–7 分钟随机说话
+- 点击、悬停和拖动反馈
+- 修复语音按钮与收回箭头点击穿透
+- 一键安装、登录自启动、状态诊断和卸载
+- 不依赖外部 AI、API 或聊天框
 
-The dialogue style intentionally avoids colons and sentence-ending periods so the lines feel more like natural conversation.
+## 为什么按钮会点不了
 
-## Requirements
+问题不在 `pet.json` 或精灵图。部分 Windows Codex 版本把宠物放在同时具有 `WS_EX_TRANSPARENT` 和 `WS_EX_LAYERED` 的顶层窗口中。按钮虽然显示在最上层，Windows 却可能把点击交给后面的 Edge、桌面或其他窗口。
 
-- Windows 10 or 11
-- Codex desktop app with custom pet support
+本仓库的输入桥会在鼠标进入宠物控制区域时临时关闭这两种命中穿透，离开后恢复原始窗口样式。如果第一次按下仍落到后面的窗口，它只补发一次 Windows 原生单击，不会改动 Codex 安装文件。
+
+## 系统要求
+
+- Windows 10 或 Windows 11
+- 支持自定义宠物的 Codex 桌面端
 - Windows PowerShell 5.1
-- .NET Framework WPF support, included with normal Windows installations
+- 系统自带的 .NET Framework/WPF
 
-The speech overlay and input bridge use WPF and Win32 window detection, so those optional features are Windows-only. The pet artwork itself can still be used anywhere that supports the Codex v2 pet format.
+宠物精灵图本身可以用于任何支持 Codex v2 宠物格式的平台；说话和按钮修复助手目前仅支持 Windows。
 
-## Install
+## 推荐安装方式
 
-Open Windows PowerShell and run:
+克隆仓库或下载并解压 GitHub ZIP，然后在该文件夹打开 Windows PowerShell：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\Install-ProfessorCluckshot.ps1
+```
+
+安装器会自动：
+
+1. 检测 `$env:CODEX_HOME`；未设置时使用 `$env:USERPROFILE\.codex`
+2. 安装到 `pets\professor-cluckshot`
+3. 解除 PowerShell 文件下载锁定
+4. 启动输入桥和说话助手
+5. 在当前用户启动文件夹注册登录自启动
+
+不需要管理员权限，也不会重启 Codex。安装后刷新宠物列表并选择 **Professor Cluckshot**。
+
+如果不希望登录自启动：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\Install-ProfessorCluckshot.ps1 -NoStartup
+```
+
+## 更新
+
+在仓库目录更新后重新运行安装器即可；安装器会先安全停止旧助手，再覆盖运行文件并重新启动：
+
+```powershell
+git pull
+powershell -NoProfile -ExecutionPolicy Bypass -File .\Install-ProfessorCluckshot.ps1
+```
+
+## 状态诊断
 
 ```powershell
 $codexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE '.codex' }
 $petPath = Join-Path $codexHome 'pets\professor-cluckshot'
-git clone https://github.com/MHZ-SUDO/professor-cluckshot.git $petPath
-Set-Location $petPath
-Get-ChildItem -Filter *.ps1 | Unblock-File
-.\Start-PaperCheer.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $petPath 'Get-PaperCheerStatus.ps1')
 ```
 
-Refresh the Codex pet list, then select **Professor Cluckshot** in the pet settings. A Codex restart is normally unnecessary.
+重点结果：
 
-If the destination folder already exists, update it instead of cloning again:
+- `manifestValid: true`
+- `spriteExists: true`
+- `inputBridgeRunning: true`
+- `speechOverlayRunning: true`
+- `startupRegistered: true`
+- 宠物可见时 `overlayProbe.overlayFound: true`
+
+立即测试说话：
 
 ```powershell
-Set-Location $petPath
+powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $petPath 'Show-PaperCheer.ps1') -Trigger click -VisibleSeconds 15
+```
+
+## 手动控制
+
+```powershell
+# 启动按钮修复和说话助手
+.\Start-PaperCheer.ps1
+
+# 停止两个助手
 .\Stop-PaperCheer.ps1
-git pull
-Get-ChildItem -Filter *.ps1 | Unblock-File
-.\Start-PaperCheer.ps1
-```
 
-The final command starts both required Windows helpers:
+# 自定义随机说话间隔
+.\Start-PaperCheer.ps1 -MinIntervalSeconds 120 -MaxIntervalSeconds 360
 
-- `inputBridge` temporarily disables transparent/layered hit testing over the pet controls and, if a click still reaches the window underneath, retries one native single click while the pet window is interactive.
-- `speechOverlay` provides the random dialogue bubble and click, hover, and drag reactions.
-
-Windows does not automatically execute PowerShell scripts downloaded from GitHub. Run `Start-PaperCheer.ps1` once after each Windows sign-in if you want the dialogue and input repair active for that session.
-
-## Verify the repair
-
-The start command returns JSON containing both `inputBridge.processId` and `speechOverlay.processId`. Then verify speech without waiting for the random timer:
-
-```powershell
-.\Show-PaperCheer.ps1 -Trigger click -VisibleSeconds 15
-```
-
-You should see a speech bubble above the pet. Move the pointer onto the two round controls and confirm that the voice button and downward arrow are clickable with a single click.
-
-For a read-only bridge probe:
-
-```powershell
+# 只读检查宠物覆盖层
 .\CodexPetInputBridge.ps1 -ProbeOnly
 ```
 
-`overlayFound` should be `true` while the Codex pet is visible. The bridge keeps searching if Codex is opened after the helper starts or if the pet overlay is recreated.
+支持的说话触发器：`random`、`start`、`thinking`、`running`、`reviewing`、`waiting`、`success`、`failure`、`idle`、`click`、`hover` 和 `drag`。
 
-## Use
-
-Start the input repair and random dialogue overlay:
+## 卸载
 
 ```powershell
-.\Start-PaperCheer.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $petPath 'Uninstall-ProfessorCluckshot.ps1')
 ```
 
-Make Professor Cluckshot speak immediately:
+卸载器会停止两个助手、删除登录自启动入口并删除该独立宠物目录，不会影响其他宠物或 Codex。
 
-```powershell
-.\Show-PaperCheer.ps1 -VisibleSeconds 15
-```
+仅取消自启动并保留文件时，可以重新运行安装器并传入 `-NoStartup`；或者运行卸载器时使用 `-KeepFiles`。
 
-Trigger a particular mood:
+## 主要文件
 
-```powershell
-.\Show-PaperCheer.ps1 -Trigger reviewing -VisibleSeconds 15
-.\Show-PaperCheer.ps1 -Trigger success -VisibleSeconds 15
-.\Show-PaperCheer.ps1 -Trigger failure -VisibleSeconds 15
-```
+- `pet.json`：Codex v2 宠物清单
+- `spritesheet.webp`：8 × 11 动画图集
+- `CodexPetInputBridge.ps1`：圆形按钮和宠物输入修复
+- `PaperCheerOverlay.ps1`：说话气泡和交互检测
+- `Install-ProfessorCluckshot.ps1`：安装、升级、自启动和启动
+- `Get-PaperCheerStatus.ps1`：只读状态诊断
+- `Uninstall-ProfessorCluckshot.ps1`：停止、取消自启动和卸载
+- `Start-PaperCheer.ps1` / `Stop-PaperCheer.ps1`：运行控制
+- `paper-cheer-dialogue.json`：固定台词和动态模板
 
-Supported triggers are `random`, `start`, `thinking`, `running`, `reviewing`, `waiting`, `success`, `failure`, `idle`, `click`, `hover`, and `drag`.
+## 说明
 
-Stop both helpers:
+Codex 原生读取 `pet.json` 和 `spritesheet.webp`。说话与 Windows 点击修复由独立 PowerShell 助手提供；它们只修改宠物窗口的临时运行样式，不修改 Codex 安装文件。
 
-```powershell
-.\Stop-PaperCheer.ps1
-```
-
-Change the automatic interval, in seconds:
-
-```powershell
-.\Start-PaperCheer.ps1 -MinIntervalSeconds 120 -MaxIntervalSeconds 360
-```
-
-## Files
-
-- `pet.json` defines the Codex v2 pet and optional animation chains
-- `spritesheet.webp` contains the animation atlas
-- `paper-cheer-dialogue.json` contains the fixed dialogue and generation templates
-- `CodexPetInputBridge.ps1` repairs pointer delivery to the Codex pet overlay
-- `PaperCheerOverlay.ps1` provides the speech bubble and interaction detection
-- `Start-PaperCheer.ps1`, `Stop-PaperCheer.ps1`, and `Show-PaperCheer.ps1` control the helpers
-- `say-paper-cheer.ps1` and `watch-paper-cheer.ps1` are compatibility helpers for other local pet runtimes
-
-## Notes
-
-Codex reads the pet manifest and spritesheet, while the optional PowerShell helpers supply custom dialogue, interaction detection, and the click-through workaround. They do not modify the Codex installation and do not restart Codex.
-
-The helpers write small runtime state files beside the scripts. They are ignored by Git.
+运行时会在宠物目录写入少量 PID、状态和命令文件，这些文件已被 Git 忽略。
 
 ## License
 
-The source code, dialogue data, and documentation are released under the MIT License.
-
-The included character artwork is not covered by the MIT License. See [ASSET_NOTICE.md](ASSET_NOTICE.md) before reusing or redistributing the spritesheet.
+代码、台词和文档使用 MIT License。角色图像不包含在 MIT 授权中；重用或再分发精灵图前请阅读 [ASSET_NOTICE.md](ASSET_NOTICE.md)。
