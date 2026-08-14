@@ -13,7 +13,7 @@ param(
     [int]$VisibleSeconds = 13,
 
     [ValidateRange(1, 30)]
-    [int]$RecentHistorySize = 14,
+    [int]$RecentHistorySize = 32,
 
     [switch]$Once
 )
@@ -710,7 +710,8 @@ function Register-PetClick {
     param(
         [datetime]$At,
         [int]$X,
-        [int]$Y
+        [int]$Y,
+        [IntPtr]$ForegroundBefore = [IntPtr]::Zero
     )
 
     if ($At -lt $script:ignorePetClicksUntil) {
@@ -751,13 +752,17 @@ function Register-PetClick {
     $script:pendingPetClickAt = $At
     $script:pendingPetClickX = $X
     $script:pendingPetClickY = $Y
+    if ($ForegroundBefore -ne [IntPtr]::Zero) {
+        $script:foregroundBeforePetClick = $ForegroundBefore
+    }
     if ($script:foregroundBeforePetClick -ne [IntPtr]::Zero) {
         $script:pendingForegroundRestore = $script:foregroundBeforePetClick
-        # Do not switch windows during the native double-click interval: a
-        # foreground switch can swallow the second physical click. A true
-        # single click is restored immediately after this interval expires.
-        $script:pendingForegroundRestoreAt = $At.AddMilliseconds($script:doubleClickMilliseconds + 25)
-        $script:pendingForegroundRestoreStopAt = $null
+        # The native pet raises Codex on its first click. Restore the window
+        # that was active before mouse-down immediately; the input bridge still
+        # sees a second physical click globally and double-click can raise Codex.
+        [void][PaperCheer.NativeWindow]::RestoreForegroundWindow($script:pendingForegroundRestore)
+        $script:pendingForegroundRestoreAt = (Get-Date).AddMilliseconds(75)
+        $script:pendingForegroundRestoreStopAt = $At.AddMilliseconds($script:doubleClickMilliseconds)
     }
     Write-PetInteractionState -Action 'pending-single' -At $At
 }
@@ -794,7 +799,11 @@ function Receive-PetPointerEvents {
                     [Globalization.CultureInfo]::InvariantCulture,
                     [Globalization.DateTimeStyles]::RoundtripKind
                 ).ToLocalTime()
-                Register-PetClick -At $eventAt -X ([int]$event.x) -Y ([int]$event.y)
+                $foregroundBefore = [IntPtr]::Zero
+                if ($null -ne $event.PSObject.Properties['foregroundBefore']) {
+                    $foregroundBefore = [IntPtr]::new([long]$event.foregroundBefore)
+                }
+                Register-PetClick -At $eventAt -X ([int]$event.x) -Y ([int]$event.y) -ForegroundBefore $foregroundBefore
             }
         }
     }

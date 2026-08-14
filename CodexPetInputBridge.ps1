@@ -71,6 +71,27 @@ public static class ProfessorCluckshotInputNative
     public static extern short GetAsyncKeyState(int virtualKey);
 
     [DllImport("user32.dll")]
+    public static extern IntPtr GetForegroundWindow();
+
+    [DllImport("user32.dll")]
+    public static extern bool SetForegroundWindow(IntPtr hwnd);
+
+    [DllImport("user32.dll")]
+    public static extern bool ShowWindowAsync(IntPtr hwnd, int command);
+
+    [DllImport("user32.dll")]
+    public static extern bool BringWindowToTop(IntPtr hwnd);
+
+    [DllImport("user32.dll")]
+    public static extern void SwitchToThisWindow(IntPtr hwnd, bool altTab);
+
+    [DllImport("user32.dll")]
+    public static extern uint GetCurrentThreadId();
+
+    [DllImport("user32.dll")]
+    public static extern bool AttachThreadInput(uint attach, uint attachTo, bool enabled);
+
+    [DllImport("user32.dll")]
     public static extern IntPtr WindowFromPoint(POINT point);
 
     [DllImport("user32.dll")]
@@ -107,6 +128,25 @@ public static class ProfessorCluckshotInputNative
 
     [DllImport("user32.dll")]
     public static extern bool GetMonitorInfo(IntPtr monitor, ref MONITORINFO info);
+
+    public static bool RestoreForegroundWindow(IntPtr window)
+    {
+        if (window == IntPtr.Zero || !IsWindow(window)) return false;
+        uint processId;
+        IntPtr foreground = GetForegroundWindow();
+        uint foregroundThread = foreground == IntPtr.Zero
+            ? 0
+            : GetWindowThreadProcessId(foreground, out processId);
+        uint currentThread = GetCurrentThreadId();
+        bool attached = foregroundThread != 0 && foregroundThread != currentThread &&
+            AttachThreadInput(currentThread, foregroundThread, true);
+        ShowWindowAsync(window, 9);
+        BringWindowToTop(window);
+        SetForegroundWindow(window);
+        SwitchToThisWindow(window, true);
+        if (attached) AttachThreadInput(currentThread, foregroundThread, false);
+        return true;
+    }
 
     public static bool GetPetHorizontalBand(IntPtr overlay, out double leftFraction, out double rightFraction)
     {
@@ -377,7 +417,8 @@ function Publish-PetBodyClick {
     param(
         [datetime]$At,
         [int]$X,
-        [int]$Y
+        [int]$Y,
+        [IntPtr]$ForegroundBefore
     )
 
     $script:pointerEventSequence++
@@ -387,6 +428,7 @@ function Publish-PetBodyClick {
         at = $At.ToString('o')
         x = $X
         y = $Y
+        foregroundBefore = $ForegroundBefore.ToInt64()
     }
     $script:pointerEvents = @($script:pointerEvents + $event | Select-Object -Last 8)
     $written = Write-PointerEventFile
@@ -528,6 +570,12 @@ try {
     $bodyReleaseCandidateAt = $null
     $bodyReleaseX = 0
     $bodyReleaseY = 0
+    $bodyForegroundBefore = [IntPtr]::Zero
+    $bodyReleaseForegroundBefore = [IntPtr]::Zero
+    # Keep the foreground from the last idle polling tick. The native Codex
+    # pet can activate its main window before the mouse-down tick is observed,
+    # so GetForegroundWindow() on that tick may already be too late.
+    $foregroundBeforeMouseDown = [ProfessorCluckshotInputNative]::GetForegroundWindow()
     $script:pointerEventPath = Join-Path $PSScriptRoot 'paper-cheer-pointer-events.json'
     $script:pointerEventSession = [Guid]::NewGuid().ToString('N')
     $script:pointerEventSequence = 0
@@ -570,13 +618,13 @@ try {
                 # second click arrives later, so first publish the completed
                 # click before arming the next one.
                 if ($releaseAge -ge 20) {
-                    Publish-PetBodyClick -At $bodyReleaseCandidateAt -X $bodyReleaseX -Y $bodyReleaseY
+                    Publish-PetBodyClick -At $bodyReleaseCandidateAt -X $bodyReleaseX -Y $bodyReleaseY -ForegroundBefore $bodyReleaseForegroundBefore
                 } else {
                     $resumeBodyClick = $true
                 }
                 $bodyReleaseCandidateAt = $null
             } elseif ($releaseAge -ge 25) {
-                Publish-PetBodyClick -At $bodyReleaseCandidateAt -X $bodyReleaseX -Y $bodyReleaseY
+                Publish-PetBodyClick -At $bodyReleaseCandidateAt -X $bodyReleaseX -Y $bodyReleaseY -ForegroundBefore $bodyReleaseForegroundBefore
                 $bodyReleaseCandidateAt = $null
             }
         }
@@ -596,6 +644,18 @@ try {
                 $bodyDownX = $snapshot.cursorX
                 $bodyDownY = $snapshot.cursorY
                 $bodyMaxDistance = 0.0
+                $bodyForegroundBefore = $foregroundBeforeMouseDown
+                if ($bodyForegroundBefore -eq $overlay) {
+                    $bodyForegroundBefore = [IntPtr]::Zero
+                }
+                if ($bodyForegroundBefore -eq [IntPtr]::Zero) {
+                    $bodyForegroundBefore = [ProfessorCluckshotInputNative]::GetForegroundWindow()
+                }
+                # Undo the native pet's focus activation on mouse-down, before
+                # waiting for release and single/double-click classification.
+                if ($bodyForegroundBefore -ne [IntPtr]::Zero -and $bodyForegroundBefore -ne $overlay) {
+                    [void][ProfessorCluckshotInputNative]::RestoreForegroundWindow($bodyForegroundBefore)
+                }
             }
         }
 
@@ -616,6 +676,7 @@ try {
                 $bodyReleaseCandidateAt = [DateTime]::UtcNow
                 $bodyReleaseX = $snapshot.cursorX
                 $bodyReleaseY = $snapshot.cursorY
+                $bodyReleaseForegroundBefore = $bodyForegroundBefore
             }
             $bodyClickArmed = $false
         }
@@ -694,6 +755,12 @@ try {
             $syntheticClickPending = $false
         }
 
+        if (-not $leftButtonDown -and -not $mouseWasDown) {
+            $idleForeground = [ProfessorCluckshotInputNative]::GetForegroundWindow()
+            if ($idleForeground -ne [IntPtr]::Zero -and $idleForeground -ne $overlay) {
+                $foregroundBeforeMouseDown = $idleForeground
+            }
+        }
         $mouseWasDown = $leftButtonDown
         $pollDelayMilliseconds = if ($dragCaptureActive) { 1 } elseif ($keepInteractive) { 2 } else { 15 }
         [Threading.Thread]::Sleep($pollDelayMilliseconds)
