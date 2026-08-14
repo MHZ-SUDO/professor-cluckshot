@@ -373,6 +373,7 @@ $dialoguePath = Join-Path $packageRoot 'paper-cheer-dialogue.json'
 $statePath = Join-Path $packageRoot 'paper-cheer-overlay-state.json'
 $lastMessagePath = Join-Path $packageRoot 'paper-cheer-last-message.json'
 $commandPath = Join-Path $packageRoot 'paper-cheer-command.json'
+$pointerEventPath = Join-Path $packageRoot 'paper-cheer-pointer-events.json'
 
 if (-not (Test-Path -LiteralPath $dialoguePath)) {
     throw "找不到台词库：$dialoguePath"
@@ -558,6 +559,7 @@ function Take-ManualCommand {
 }
 
 $window = New-Object System.Windows.Window
+$window.Title = 'Professor Cluckshot Speech Overlay'
 $window.WindowStyle = [System.Windows.WindowStyle]::None
 $window.ResizeMode = [System.Windows.ResizeMode]::NoResize
 $window.AllowsTransparency = $true
@@ -603,6 +605,8 @@ $panel.Children.Add($messageText) | Out-Null
 $border.Child = $panel
 $window.Content = $border
 $script:bubbleHandle = [IntPtr]::Zero
+$script:bubbleSource = $null
+$script:pointerMessageHook = $null
 
 function Update-BubblePosition {
     $virtualLeft = [System.Windows.SystemParameters]::VirtualScreenLeft
@@ -680,7 +684,11 @@ function Write-PetInteractionState {
     param([string]$Action, [datetime]$At)
 
     $script:interactionRegisterCount++
-    $event = [pscustomobject]@{ action = $Action; at = $At.ToString('o') }
+    $event = [pscustomobject]@{
+        action = $Action
+        at = $At.ToString('o')
+        recordedAt = (Get-Date).ToString('o')
+    }
     $script:interactionHistory = @($script:interactionHistory + $event | Select-Object -Last 12)
     $payload = [ordered]@{
         action = $Action
@@ -688,6 +696,7 @@ function Write-PetInteractionState {
         registerCount = $script:interactionRegisterCount
         foregroundBeforeClick = $script:foregroundBeforePetClick.ToInt64()
         restoreWindow = $script:pendingForegroundRestore.ToInt64()
+        doubleClickMilliseconds = $script:doubleClickMilliseconds
         history = $script:interactionHistory
     }
     [System.IO.File]::WriteAllText(
@@ -747,10 +756,52 @@ function Register-PetClick {
         # Do not switch windows during the native double-click interval: a
         # foreground switch can swallow the second physical click. A true
         # single click is restored immediately after this interval expires.
-        $script:pendingForegroundRestoreAt = $At.AddMilliseconds($script:systemDoubleClickMilliseconds + 25)
+        $script:pendingForegroundRestoreAt = $At.AddMilliseconds($script:doubleClickMilliseconds + 25)
         $script:pendingForegroundRestoreStopAt = $null
     }
     Write-PetInteractionState -Action 'pending-single' -At $At
+}
+
+function Receive-PetPointerEvents {
+    if (-not (Test-Path -LiteralPath $pointerEventPath -PathType Leaf)) {
+        return
+    }
+
+    try {
+        $state = Get-Content -LiteralPath $pointerEventPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        if ($null -eq $state -or [string]::IsNullOrWhiteSpace([string]$state.sessionId)) {
+            return
+        }
+
+        if ($script:pointerEventSession -ne [string]$state.sessionId) {
+            $script:pointerEventSession = [string]$state.sessionId
+            $script:processedPointerEventIds = @()
+        }
+
+        foreach ($event in @($state.events)) {
+            $eventId = [string]$event.id
+            if ([string]::IsNullOrWhiteSpace($eventId) -or
+                $script:processedPointerEventIds -contains $eventId) {
+                continue
+            }
+
+            $script:processedPointerEventIds = @(
+                @($script:processedPointerEventIds) + $eventId | Select-Object -Last 24
+            )
+            if ([string]$event.kind -eq 'click') {
+                $eventAt = [datetime]::Parse(
+                    [string]$event.at,
+                    [Globalization.CultureInfo]::InvariantCulture,
+                    [Globalization.DateTimeStyles]::RoundtripKind
+                ).ToLocalTime()
+                Register-PetClick -At $eventAt -X ([int]$event.x) -Y ([int]$event.y)
+            }
+        }
+    }
+    catch {
+        # The bridge replaces this tiny file atomically. If antivirus or file
+        # indexing briefly holds it, retry naturally on the next 25 ms tick.
+    }
 }
 
 $app = New-Object System.Windows.Application
@@ -786,11 +837,12 @@ $script:pendingForegroundRestoreStopAt = $null
 $script:ignorePetClicksUntil = [datetime]::MinValue
 $script:interactionRegisterCount = 0
 $script:interactionHistory = @()
+$script:pointerEventSession = ''
+$script:processedPointerEventIds = @()
 $script:systemDoubleClickMilliseconds = [Math]::Max(200, [int][PaperCheer.NativeWindow]::GetDoubleClickTime())
-# The native Codex pet can relay its second click about one second late after
-# opening the main window. Keep a wider logical pairing window while restoring
-# the previous foreground on the normal Windows double-click schedule.
-$script:doubleClickMilliseconds = [Math]::Max(1600, $script:systemDoubleClickMilliseconds)
+# Windows double-click timing can be unusually high on a machine. Cap the pet's
+# own pairing window so a single speaks promptly without changing system input.
+$script:doubleClickMilliseconds = [Math]::Max(250, [Math]::Min(550, $script:systemDoubleClickMilliseconds))
 $script:petHitBounds = Get-PetHitBounds
 
 $interactionTimer = New-Object System.Windows.Threading.DispatcherTimer
@@ -809,6 +861,22 @@ $interactionTimer.Add_Tick({
     $leftButtonState = [int][PaperCheer.NativeWindow]::GetAsyncKeyState(1)
     $leftButtonDown = (($leftButtonState -band 0x8000) -ne 0)
 
+    Receive-PetPointerEvents
+
+    if ($null -ne $script:pendingPetClickAt -and
+        ($now - $script:pendingPetClickAt).TotalMilliseconds -gt $script:doubleClickMilliseconds) {
+        $script:pendingPetClickAt = $null
+        Write-PetInteractionState -Action 'single' -At $now
+        Show-PetInteraction -Trigger 'click'
+        $script:lastPetClickAt = $now
+        $script:lastPetHoverAt = $now
+        if ($script:pendingForegroundRestore -ne [IntPtr]::Zero) {
+            [void][PaperCheer.NativeWindow]::RestoreForegroundWindow($script:pendingForegroundRestore)
+            $script:pendingForegroundRestoreAt = $now.AddMilliseconds(75)
+            $script:pendingForegroundRestoreStopAt = $now.AddSeconds(2)
+        }
+    }
+
     if ($script:pendingForegroundRestore -ne [IntPtr]::Zero -and
         $null -ne $script:pendingForegroundRestoreAt -and
         $now -ge $script:pendingForegroundRestoreAt) {
@@ -821,20 +889,6 @@ $interactionTimer.Add_Tick({
         } else {
             $script:pendingForegroundRestoreAt = $now.AddMilliseconds(75)
         }
-    }
-
-    if ($null -ne $script:pendingPetClickAt -and
-        ($now - $script:pendingPetClickAt).TotalMilliseconds -gt $script:doubleClickMilliseconds) {
-        $script:pendingPetClickAt = $null
-        if ($script:pendingForegroundRestore -ne [IntPtr]::Zero) {
-            [void][PaperCheer.NativeWindow]::RestoreForegroundWindow($script:pendingForegroundRestore)
-            $script:pendingForegroundRestoreAt = $now.AddMilliseconds(75)
-            $script:pendingForegroundRestoreStopAt = $now.AddSeconds(2)
-        }
-        Write-PetInteractionState -Action 'single' -At $now
-        Show-PetInteraction -Trigger 'click'
-        $script:lastPetClickAt = $now
-        $script:lastPetHoverAt = $now
     }
 
     if ($overPet -and -not $leftButtonDown) {
@@ -869,8 +923,6 @@ $interactionTimer.Add_Tick({
                 Show-PetInteraction -Trigger 'drag'
                 $script:lastPetDragAt = $now
                 $script:lastPetHoverAt = $now
-            } elseif ($distance -lt 16) {
-                Register-PetClick -At $now -X $cursor.X -Y $cursor.Y
             }
         }
         $script:mouseDownOnPet = $false
@@ -972,6 +1024,22 @@ $window.Add_SourceInitialized({
     $helper = New-Object System.Windows.Interop.WindowInteropHelper($window)
     $script:bubbleHandle = $helper.Handle
     [PaperCheer.NativeWindow]::MakeClickThrough($script:bubbleHandle)
+    $script:bubbleSource = [System.Windows.Interop.HwndSource]::FromHwnd($script:bubbleHandle)
+    $script:pointerMessageHook = [System.Windows.Interop.HwndSourceHook]{
+        param(
+            [IntPtr]$Hwnd,
+            [int]$Message,
+            [IntPtr]$WParam,
+            [IntPtr]$LParam,
+            [ref]$Handled
+        )
+        if ($Message -eq 0x8001) {
+            Receive-PetPointerEvents
+            $Handled.Value = $true
+        }
+        return [IntPtr]::Zero
+    }
+    $script:bubbleSource.AddHook($script:pointerMessageHook)
 })
 
 $window.Add_Closed({
@@ -979,6 +1047,9 @@ $window.Add_Closed({
     $interactionTimer.Stop()
     $autoTimer.Stop()
     $hideTimer.Stop()
+    if ($null -ne $script:bubbleSource -and $null -ne $script:pointerMessageHook) {
+        $script:bubbleSource.RemoveHook($script:pointerMessageHook)
+    }
     $app.Shutdown()
 })
 

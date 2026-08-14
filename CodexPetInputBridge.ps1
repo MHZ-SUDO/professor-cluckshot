@@ -52,6 +52,9 @@ public static class ProfessorCluckshotInputNative
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     public static extern int GetWindowText(IntPtr hwnd, StringBuilder text, int count);
 
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    public static extern IntPtr FindWindow(string className, string windowName);
+
     [DllImport("user32.dll")]
     public static extern bool IsWindow(IntPtr hwnd);
 
@@ -344,6 +347,70 @@ function Write-RelayState {
     )
 }
 
+function Write-PointerEventFile {
+    $payload = [ordered]@{
+        processId = $PID
+        sessionId = $script:pointerEventSession
+        sequence = $script:pointerEventSequence
+        events = @($script:pointerEvents)
+    }
+    $json = $payload | ConvertTo-Json -Depth 4 -Compress
+    for ($attempt = 0; $attempt -lt 5; $attempt++) {
+        try {
+            [System.IO.File]::WriteAllText(
+                $script:pointerEventPath,
+                $json,
+                (New-Object System.Text.UTF8Encoding($false))
+            )
+            return $true
+        }
+        catch {
+            # The speech process may be reading this tiny state file. A brief
+            # collision must never terminate the global input bridge.
+            [Threading.Thread]::Sleep(5)
+        }
+    }
+    return $false
+}
+
+function Publish-PetBodyClick {
+    param(
+        [datetime]$At,
+        [int]$X,
+        [int]$Y
+    )
+
+    $script:pointerEventSequence++
+    $event = [ordered]@{
+        id = '{0}:{1}' -f $script:pointerEventSession, $script:pointerEventSequence
+        kind = 'click'
+        at = $At.ToString('o')
+        x = $X
+        y = $Y
+    }
+    $script:pointerEvents = @($script:pointerEvents + $event | Select-Object -Last 8)
+    $written = Write-PointerEventFile
+    if ($written) {
+        try {
+            $speechWindow = [ProfessorCluckshotInputNative]::FindWindow(
+                [string]$null,
+                'Professor Cluckshot Speech Overlay'
+            )
+            if ($speechWindow -ne [IntPtr]::Zero) {
+                [void][ProfessorCluckshotInputNative]::PostMessage(
+                    $speechWindow,
+                    0x8001,
+                    [IntPtr]::Zero,
+                    [IntPtr]::Zero
+                )
+            }
+        }
+        catch {
+            # The 25 ms file poll remains the fallback if notification fails.
+        }
+    }
+}
+
 function Set-OverlayTransparent {
     param(
         [IntPtr]$Overlay,
@@ -454,6 +521,18 @@ try {
     $syntheticClickPending = $false
     $syntheticDownX = 0
     $syntheticDownY = 0
+    $bodyClickArmed = $false
+    $bodyDownX = 0
+    $bodyDownY = 0
+    $bodyMaxDistance = 0.0
+    $bodyReleaseCandidateAt = $null
+    $bodyReleaseX = 0
+    $bodyReleaseY = 0
+    $script:pointerEventPath = Join-Path $PSScriptRoot 'paper-cheer-pointer-events.json'
+    $script:pointerEventSession = [Guid]::NewGuid().ToString('N')
+    $script:pointerEventSequence = 0
+    $script:pointerEvents = @()
+    [void](Write-PointerEventFile)
 
     while ($true) {
         if ($overlay -eq [IntPtr]::Zero -or -not [ProfessorCluckshotInputNative]::IsWindow($overlay)) {
@@ -472,6 +551,8 @@ try {
             $dragCaptureActive = $false
             $dragReleaseCandidateAt = $null
             $dragLastMotionAt = [DateTime]::MinValue
+            $bodyClickArmed = $false
+            $bodyReleaseCandidateAt = $null
             $overlay = [IntPtr]::Zero
             Start-Sleep -Milliseconds 100
             continue
@@ -480,7 +561,27 @@ try {
         $leftButtonDown = (([int][ProfessorCluckshotInputNative]::GetAsyncKeyState(1) -band 0x8000) -ne 0)
         $inControlZone = Test-PetControlZone -Snapshot $snapshot
         $inPetBody = Test-PetBodyZone -Snapshot $snapshot
-        if ($leftButtonDown -and -not $mouseWasDown -and $inPetBody) {
+        $resumeBodyClick = $false
+
+        if ($null -ne $bodyReleaseCandidateAt) {
+            $releaseAge = ([DateTime]::UtcNow - $bodyReleaseCandidateAt).TotalMilliseconds
+            if ($leftButtonDown) {
+                # Ignore a sub-20 ms up/down glitch during a held drag. A real
+                # second click arrives later, so first publish the completed
+                # click before arming the next one.
+                if ($releaseAge -ge 20) {
+                    Publish-PetBodyClick -At $bodyReleaseCandidateAt -X $bodyReleaseX -Y $bodyReleaseY
+                } else {
+                    $resumeBodyClick = $true
+                }
+                $bodyReleaseCandidateAt = $null
+            } elseif ($releaseAge -ge 25) {
+                Publish-PetBodyClick -At $bodyReleaseCandidateAt -X $bodyReleaseX -Y $bodyReleaseY
+                $bodyReleaseCandidateAt = $null
+            }
+        }
+
+        if ($leftButtonDown -and -not $mouseWasDown -and ($inPetBody -or $resumeBodyClick)) {
             # Once a body drag starts, keep the overlay interactive until the
             # physical mouse button is released. Otherwise crossing the
             # narrow pet hit band restores click-through mid-drag and the
@@ -490,6 +591,33 @@ try {
             $dragLastCursorX = $snapshot.cursorX
             $dragLastCursorY = $snapshot.cursorY
             $dragLastMotionAt = [DateTime]::UtcNow
+            $bodyClickArmed = $true
+            if (-not $resumeBodyClick) {
+                $bodyDownX = $snapshot.cursorX
+                $bodyDownY = $snapshot.cursorY
+                $bodyMaxDistance = 0.0
+            }
+        }
+
+        if ($bodyClickArmed) {
+            $bodyCurrentDistance = [Math]::Sqrt(
+                [Math]::Pow($snapshot.cursorX - $bodyDownX, 2) +
+                [Math]::Pow($snapshot.cursorY - $bodyDownY, 2)
+            )
+            $bodyMaxDistance = [Math]::Max($bodyMaxDistance, $bodyCurrentDistance)
+        }
+
+        if (-not $leftButtonDown -and $mouseWasDown -and $bodyClickArmed) {
+            $bodyDistance = [Math]::Sqrt(
+                [Math]::Pow($snapshot.cursorX - $bodyDownX, 2) +
+                [Math]::Pow($snapshot.cursorY - $bodyDownY, 2)
+            )
+            if ($bodyDistance -lt 16 -and $bodyMaxDistance -lt 16) {
+                $bodyReleaseCandidateAt = [DateTime]::UtcNow
+                $bodyReleaseX = $snapshot.cursorX
+                $bodyReleaseY = $snapshot.cursorY
+            }
+            $bodyClickArmed = $false
         }
         if ($dragCaptureActive) {
             $dragNow = [DateTime]::UtcNow

@@ -108,7 +108,7 @@ if (-not $SkipStart) {
 
 [pscustomobject]@{
     installed = $true
-    version = '1.2.1'
+    version = '1.2.2'
     petPath = $petPath
     startupRegistered = $registerStartup -and (Test-Path -LiteralPath $startupShortcutPath)
     startupShortcut = if ($registerStartup) { $startupShortcutPath } else { $null }
