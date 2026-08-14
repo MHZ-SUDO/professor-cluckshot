@@ -1,15 +1,23 @@
 [CmdletBinding()]
 param(
-    [switch]$ProbeOnly
+    [switch]$ProbeOnly,
+
+    [switch]$HookProbe
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+Add-Type -AssemblyName UIAutomationClient
+Add-Type -AssemblyName UIAutomationTypes
+
 $source = @'
 using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Threading;
 
 public static class ProfessorCluckshotInputNative
 {
@@ -30,6 +38,43 @@ public static class ProfessorCluckshotInputNative
         public int X;
         public int Y;
     }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct MSLLHOOKSTRUCT
+    {
+        public POINT Point;
+        public uint MouseData;
+        public uint Flags;
+        public uint Time;
+        public UIntPtr ExtraInfo;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct MSG
+    {
+        public IntPtr Window;
+        public uint Message;
+        public UIntPtr WParam;
+        public IntPtr LParam;
+        public uint Time;
+        public POINT Point;
+        public uint Private;
+    }
+
+    public sealed class MouseHookEventRecord
+    {
+        public int Message { get; set; }
+        public int X { get; set; }
+        public int Y { get; set; }
+        public long UtcTicks { get; set; }
+        public long ForegroundBefore { get; set; }
+        public long ForegroundAtEvent { get; set; }
+        public int ForegroundShowStateBefore { get; set; }
+        public bool NativeClickSuppressed { get; set; }
+        public bool NativeClickDeflected { get; set; }
+    }
+
+    private delegate IntPtr LowLevelMouseProc(int code, IntPtr wParam, IntPtr lParam);
 
     [StructLayout(LayoutKind.Sequential)]
     public struct MONITORINFO
@@ -70,6 +115,43 @@ public static class ProfessorCluckshotInputNative
     [DllImport("user32.dll")]
     public static extern short GetAsyncKeyState(int virtualKey);
 
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern IntPtr SetWindowsHookEx(
+        int hookId,
+        LowLevelMouseProc callback,
+        IntPtr module,
+        uint threadId
+    );
+
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool UnhookWindowsHookEx(IntPtr hook);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr CallNextHookEx(
+        IntPtr hook,
+        int code,
+        IntPtr wParam,
+        IntPtr lParam
+    );
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern int GetMessage(out MSG message, IntPtr window, uint minimum, uint maximum);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool TranslateMessage(ref MSG message);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr DispatchMessage(ref MSG message);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool PostThreadMessage(uint threadId, uint message, UIntPtr wParam, IntPtr lParam);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern IntPtr GetModuleHandle(string moduleName);
+
     [DllImport("user32.dll")]
     public static extern IntPtr GetForegroundWindow();
 
@@ -77,15 +159,12 @@ public static class ProfessorCluckshotInputNative
     public static extern bool SetForegroundWindow(IntPtr hwnd);
 
     [DllImport("user32.dll")]
-    public static extern bool ShowWindowAsync(IntPtr hwnd, int command);
+    public static extern bool IsIconic(IntPtr hwnd);
 
     [DllImport("user32.dll")]
-    public static extern bool BringWindowToTop(IntPtr hwnd);
+    public static extern bool IsZoomed(IntPtr hwnd);
 
-    [DllImport("user32.dll")]
-    public static extern void SwitchToThisWindow(IntPtr hwnd, bool altTab);
-
-    [DllImport("user32.dll")]
+    [DllImport("kernel32.dll")]
     public static extern uint GetCurrentThreadId();
 
     [DllImport("user32.dll")]
@@ -129,23 +208,337 @@ public static class ProfessorCluckshotInputNative
     [DllImport("user32.dll")]
     public static extern bool GetMonitorInfo(IntPtr monitor, ref MONITORINFO info);
 
-    public static bool RestoreForegroundWindow(IntPtr window)
+    private const int WH_MOUSE_LL = 14;
+    private const int WM_MOUSEMOVE = 0x0200;
+    private const int WM_LBUTTONDOWN = 0x0201;
+    private const int WM_LBUTTONUP = 0x0202;
+    private const uint WM_CANCELMODE = 0x001F;
+    private const uint WM_QUIT = 0x0012;
+    private const long WS_EX_TRANSPARENT = 0x00000020L;
+    private const long WS_EX_LAYERED = 0x00080000L;
+    private const long WS_EX_NOACTIVATE = 0x08000000L;
+
+    private static readonly object MouseHookSync = new object();
+    private static readonly ConcurrentQueue<MouseHookEventRecord> MouseHookEvents =
+        new ConcurrentQueue<MouseHookEventRecord>();
+    private static readonly LowLevelMouseProc MouseHookProcedure = MouseHookCallback;
+    private static readonly ManualResetEvent MouseHookReady = new ManualResetEvent(false);
+    private static Thread MouseHookThread;
+    private static IntPtr MouseHookHandle = IntPtr.Zero;
+    private static uint MouseHookThreadId;
+    private static int MouseHookLastError;
+    private static string MouseHookException = String.Empty;
+    private static volatile bool MouseLeftButtonHeld;
+    private static long MouseGuardOverlayHandle;
+    private static int MouseGuardLeft;
+    private static int MouseGuardTop;
+    private static int MouseGuardRight;
+    private static int MouseGuardBottom;
+    private static bool MouseBodyGestureActive;
+    private static int MouseBodyStartX;
+    private static int MouseBodyStartY;
+    private static long MouseBodyMaxDistanceSquared;
+    private static long MouseBodyForegroundBefore;
+    private static int MouseBodyForegroundShowStateBefore;
+    private static int MouseBodyClickDeflectionCount;
+
+    public static bool StartMouseHook()
+    {
+        lock (MouseHookSync)
+        {
+            if (MouseHookHandle != IntPtr.Zero && MouseHookThread != null && MouseHookThread.IsAlive)
+            {
+                return true;
+            }
+
+            MouseHookReady.Reset();
+            MouseHookLastError = 0;
+            MouseHookException = String.Empty;
+            MouseHookThreadId = 0;
+            MouseLeftButtonHeld = false;
+            MouseBodyGestureActive = false;
+            MouseHookThread = new Thread(MouseHookThreadMain);
+            MouseHookThread.IsBackground = true;
+            MouseHookThread.Name = "Professor Cluckshot mouse capture";
+            MouseHookThread.Start();
+        }
+
+        if (!MouseHookReady.WaitOne(2000))
+        {
+            MouseHookLastError = 1460;
+            return false;
+        }
+        return MouseHookHandle != IntPtr.Zero;
+    }
+
+    public static bool IsMouseHookActive()
+    {
+        Thread thread = MouseHookThread;
+        return MouseHookHandle != IntPtr.Zero && thread != null && thread.IsAlive;
+    }
+
+    public static int GetMouseHookLastError()
+    {
+        return MouseHookLastError;
+    }
+
+    public static string GetMouseHookException()
+    {
+        return MouseHookException;
+    }
+
+    public static MouseHookEventRecord[] DrainMouseHookEvents()
+    {
+        var drained = new List<MouseHookEventRecord>();
+        MouseHookEventRecord item;
+        while (MouseHookEvents.TryDequeue(out item))
+        {
+            drained.Add(item);
+        }
+        return drained.ToArray();
+    }
+
+    public static void ConfigurePetBodyClickGuard(
+        IntPtr overlay,
+        int left,
+        int top,
+        int right,
+        int bottom)
+    {
+        Volatile.Write(ref MouseGuardLeft, left);
+        Volatile.Write(ref MouseGuardTop, top);
+        Volatile.Write(ref MouseGuardRight, right);
+        Volatile.Write(ref MouseGuardBottom, bottom);
+        Interlocked.Exchange(ref MouseGuardOverlayHandle, overlay.ToInt64());
+    }
+
+    public static void ClearPetBodyClickGuard()
+    {
+        Interlocked.Exchange(ref MouseGuardOverlayHandle, 0L);
+        MouseBodyGestureActive = false;
+    }
+
+    public static int GetBodyClickDeflectionCount()
+    {
+        return Volatile.Read(ref MouseBodyClickDeflectionCount);
+    }
+
+    public static void StopMouseHook()
+    {
+        Thread thread;
+        uint threadId;
+        lock (MouseHookSync)
+        {
+            thread = MouseHookThread;
+            threadId = MouseHookThreadId;
+        }
+
+        if (threadId != 0)
+        {
+            PostThreadMessage(threadId, WM_QUIT, UIntPtr.Zero, IntPtr.Zero);
+        }
+        if (thread != null && thread != Thread.CurrentThread && thread.IsAlive)
+        {
+            thread.Join(1000);
+        }
+    }
+
+    private static void MouseHookThreadMain()
+    {
+        try
+        {
+            MouseHookThreadId = GetCurrentThreadId();
+            MouseHookHandle = SetWindowsHookEx(
+                WH_MOUSE_LL,
+                MouseHookProcedure,
+                GetModuleHandle(null),
+                0
+            );
+            if (MouseHookHandle == IntPtr.Zero)
+            {
+                MouseHookLastError = Marshal.GetLastWin32Error();
+                MouseHookReady.Set();
+                return;
+            }
+
+            MouseHookReady.Set();
+            MSG message;
+            while (GetMessage(out message, IntPtr.Zero, 0, 0) > 0)
+            {
+                TranslateMessage(ref message);
+                DispatchMessage(ref message);
+            }
+        }
+        catch (Exception exception)
+        {
+            MouseHookLastError = -1;
+            MouseHookException = exception.ToString();
+            MouseHookReady.Set();
+        }
+        finally
+        {
+            IntPtr hook = MouseHookHandle;
+            MouseHookHandle = IntPtr.Zero;
+            if (hook != IntPtr.Zero)
+            {
+                UnhookWindowsHookEx(hook);
+            }
+            MouseHookThreadId = 0;
+            MouseLeftButtonHeld = false;
+            MouseBodyGestureActive = false;
+        }
+    }
+
+    private static bool PointInsideBodyGuard(POINT point, out IntPtr overlay)
+    {
+        overlay = new IntPtr(Interlocked.Read(ref MouseGuardOverlayHandle));
+        if (overlay == IntPtr.Zero || !IsWindow(overlay)) return false;
+        return point.X >= Volatile.Read(ref MouseGuardLeft) &&
+            point.X <= Volatile.Read(ref MouseGuardRight) &&
+            point.Y >= Volatile.Read(ref MouseGuardTop) &&
+            point.Y <= Volatile.Read(ref MouseGuardBottom);
+    }
+
+    private static int GetWindowShowState(IntPtr window)
+    {
+        if (window == IntPtr.Zero || !IsWindow(window)) return 0;
+        if (IsIconic(window)) return 2;
+        if (IsZoomed(window)) return 3;
+        return 1;
+    }
+
+    private static void CancelNativeBodyClick(IntPtr overlay, POINT point)
+    {
+        IntPtr hit = WindowFromPoint(point);
+        if (hit != IntPtr.Zero)
+        {
+            PostMessage(hit, WM_CANCELMODE, IntPtr.Zero, IntPtr.Zero);
+        }
+        if (overlay != IntPtr.Zero && overlay != hit)
+        {
+            PostMessage(overlay, WM_CANCELMODE, IntPtr.Zero, IntPtr.Zero);
+        }
+    }
+
+    private static void DeflectNativeBodyClickRelease(IntPtr overlay)
+    {
+        if (overlay == IntPtr.Zero || !IsWindow(overlay)) return;
+        long style = GetWindowLongPtr(overlay, -20).ToInt64();
+        style |= WS_EX_TRANSPARENT | WS_EX_LAYERED | WS_EX_NOACTIVATE;
+        SetWindowLongPtr(overlay, -20, new IntPtr(style));
+        SetWindowPos(overlay, IntPtr.Zero, 0, 0, 0, 0, 0x0027);
+    }
+
+    private static IntPtr MouseHookCallback(int code, IntPtr wParam, IntPtr lParam)
+    {
+        bool deflectNativeClick = false;
+        if (code >= 0)
+        {
+            int message = wParam.ToInt32();
+            bool capture = message == WM_LBUTTONDOWN || message == WM_LBUTTONUP ||
+                (message == WM_MOUSEMOVE && MouseLeftButtonHeld);
+            if (capture)
+            {
+                MSLLHOOKSTRUCT data = (MSLLHOOKSTRUCT)Marshal.PtrToStructure(
+                    lParam,
+                    typeof(MSLLHOOKSTRUCT)
+                );
+                IntPtr guardedOverlay = IntPtr.Zero;
+                if (message == WM_LBUTTONDOWN)
+                {
+                    MouseLeftButtonHeld = true;
+                    MouseBodyGestureActive = PointInsideBodyGuard(data.Point, out guardedOverlay);
+                    if (MouseBodyGestureActive)
+                    {
+                        MouseBodyStartX = data.Point.X;
+                        MouseBodyStartY = data.Point.Y;
+                        MouseBodyMaxDistanceSquared = 0L;
+                        MouseBodyForegroundBefore = GetForegroundWindow().ToInt64();
+                        MouseBodyForegroundShowStateBefore = GetWindowShowState(
+                            new IntPtr(MouseBodyForegroundBefore)
+                        );
+                    }
+                }
+                else if (message == WM_MOUSEMOVE && MouseBodyGestureActive)
+                {
+                    long deltaX = data.Point.X - MouseBodyStartX;
+                    long deltaY = data.Point.Y - MouseBodyStartY;
+                    long distanceSquared = (deltaX * deltaX) + (deltaY * deltaY);
+                    if (distanceSquared > MouseBodyMaxDistanceSquared)
+                    {
+                        MouseBodyMaxDistanceSquared = distanceSquared;
+                    }
+                }
+                else if (message == WM_LBUTTONUP && MouseBodyGestureActive)
+                {
+                    long deltaX = data.Point.X - MouseBodyStartX;
+                    long deltaY = data.Point.Y - MouseBodyStartY;
+                    long distanceSquared = (deltaX * deltaX) + (deltaY * deltaY);
+                    if (distanceSquared > MouseBodyMaxDistanceSquared)
+                    {
+                        MouseBodyMaxDistanceSquared = distanceSquared;
+                    }
+                    deflectNativeClick = MouseBodyMaxDistanceSquared < 256L;
+                    guardedOverlay = new IntPtr(Interlocked.Read(ref MouseGuardOverlayHandle));
+                    if (deflectNativeClick)
+                    {
+                        CancelNativeBodyClick(guardedOverlay, data.Point);
+                        DeflectNativeBodyClickRelease(guardedOverlay);
+                        Interlocked.Increment(ref MouseBodyClickDeflectionCount);
+                    }
+                }
+                MouseHookEvents.Enqueue(new MouseHookEventRecord
+                {
+                    Message = message,
+                    X = data.Point.X,
+                    Y = data.Point.Y,
+                    UtcTicks = DateTime.UtcNow.Ticks,
+                    ForegroundBefore = MouseBodyGestureActive ? MouseBodyForegroundBefore : 0L,
+                    ForegroundAtEvent = GetForegroundWindow().ToInt64(),
+                    ForegroundShowStateBefore = MouseBodyGestureActive
+                        ? MouseBodyForegroundShowStateBefore
+                        : 0,
+                    NativeClickSuppressed = false,
+                    NativeClickDeflected = deflectNativeClick
+                });
+                if (message == WM_LBUTTONUP)
+                {
+                    MouseLeftButtonHeld = false;
+                    MouseBodyGestureActive = false;
+                }
+            }
+        }
+        // Never swallow the physical mouse-up. The native window receives a
+        // normal release (or the window underneath receives it after the
+        // temporary click-through switch), so drag capture cannot stick.
+        return CallNextHookEx(MouseHookHandle, code, wParam, lParam);
+    }
+
+    public static bool RestoreForegroundWithoutChangingWindowState(IntPtr window)
     {
         if (window == IntPtr.Zero || !IsWindow(window)) return false;
-        uint processId;
+        if (GetForegroundWindow() == window) return true;
+        uint ignoredProcessId;
         IntPtr foreground = GetForegroundWindow();
         uint foregroundThread = foreground == IntPtr.Zero
             ? 0
-            : GetWindowThreadProcessId(foreground, out processId);
+            : GetWindowThreadProcessId(foreground, out ignoredProcessId);
+        uint targetThread = GetWindowThreadProcessId(window, out ignoredProcessId);
         uint currentThread = GetCurrentThreadId();
-        bool attached = foregroundThread != 0 && foregroundThread != currentThread &&
+        bool attachedForeground = foregroundThread != 0 && foregroundThread != currentThread &&
             AttachThreadInput(currentThread, foregroundThread, true);
-        ShowWindowAsync(window, 9);
-        BringWindowToTop(window);
-        SetForegroundWindow(window);
-        SwitchToThisWindow(window, true);
-        if (attached) AttachThreadInput(currentThread, foregroundThread, false);
-        return true;
+        bool attachedTarget = targetThread != 0 && targetThread != currentThread &&
+            targetThread != foregroundThread && AttachThreadInput(currentThread, targetThread, true);
+        try
+        {
+            bool activated = SetForegroundWindow(window);
+            return activated || GetForegroundWindow() == window;
+        }
+        finally
+        {
+            if (attachedTarget) AttachThreadInput(currentThread, targetThread, false);
+            if (attachedForeground) AttachThreadInput(currentThread, foregroundThread, false);
+        }
     }
 
     public static bool GetPetHorizontalBand(IntPtr overlay, out double leftFraction, out double rightFraction)
@@ -253,6 +646,105 @@ public static class ProfessorCluckshotInputNative
 '@
 
 Add-Type -TypeDefinition $source
+$script:petAutomationLayout = $null
+
+if ($HookProbe) {
+    $started = [ProfessorCluckshotInputNative]::StartMouseHook()
+    Start-Sleep -Milliseconds 100
+    $active = [ProfessorCluckshotInputNative]::IsMouseHookActive()
+    $errorCode = [ProfessorCluckshotInputNative]::GetMouseHookLastError()
+    $exception = [ProfessorCluckshotInputNative]::GetMouseHookException()
+    [ProfessorCluckshotInputNative]::StopMouseHook()
+    [pscustomobject]@{
+        started = $started
+        active = $active
+        errorCode = $errorCode
+        exception = $exception
+    } | ConvertTo-Json -Compress
+    exit 0
+}
+
+function Get-PetAutomationLayout {
+    param([IntPtr]$Overlay)
+
+    if ($Overlay -eq [IntPtr]::Zero -or -not [ProfessorCluckshotInputNative]::IsWindow($Overlay)) {
+        return $null
+    }
+
+    try {
+        $root = [System.Windows.Automation.AutomationElement]::FromHandle($Overlay)
+        if ($null -eq $root) {
+            return $null
+        }
+
+        $elements = $root.FindAll(
+            [System.Windows.Automation.TreeScope]::Descendants,
+            [System.Windows.Automation.Condition]::TrueCondition
+        )
+        $preferredMascots = @()
+        $fallbackMascots = @()
+        $buttons = @()
+        for ($index = 0; $index -lt $elements.Count; $index++) {
+            try {
+                $current = $elements.Item($index).Current
+                if ($current.IsOffscreen) {
+                    continue
+                }
+                $bounds = $current.BoundingRectangle
+                if ([double]::IsNaN($bounds.Left) -or [double]::IsInfinity($bounds.Left) -or
+                    [double]::IsNaN($bounds.Top) -or [double]::IsInfinity($bounds.Top) -or
+                    $bounds.Width -le 0 -or $bounds.Height -le 0) {
+                    continue
+                }
+
+                $candidate = [pscustomobject]@{
+                    left = [int][Math]::Floor($bounds.Left)
+                    top = [int][Math]::Floor($bounds.Top)
+                    right = [int][Math]::Ceiling($bounds.Right)
+                    bottom = [int][Math]::Ceiling($bounds.Bottom)
+                    width = [int][Math]::Ceiling($bounds.Width)
+                    height = [int][Math]::Ceiling($bounds.Height)
+                    name = [string]$current.Name
+                    className = [string]$current.ClassName
+                }
+
+                if ($current.ControlType -eq [System.Windows.Automation.ControlType]::Image -and
+                    $candidate.width -ge 40 -and $candidate.height -ge 40) {
+                    $fallbackMascots += $candidate
+                    if ($candidate.className.IndexOf('codex-avatar-button', [StringComparison]::OrdinalIgnoreCase) -ge 0) {
+                        $preferredMascots += $candidate
+                    }
+                } elseif ($current.ControlType -eq [System.Windows.Automation.ControlType]::Button) {
+                    $buttons += $candidate
+                }
+            }
+            catch {
+                # A Chromium accessibility node can disappear during animation.
+            }
+        }
+
+        $mascotCandidates = if ($preferredMascots.Count -gt 0) {
+            @($preferredMascots)
+        } else {
+            @($fallbackMascots)
+        }
+        $mascot = @($mascotCandidates | Sort-Object { $_.width * $_.height } -Descending | Select-Object -First 1)
+        if ($mascot.Count -eq 0) {
+            return $null
+        }
+
+        return [pscustomobject]@{
+            overlay = $Overlay
+            mascot = $mascot[0]
+            buttons = @($buttons)
+            measuredAt = [DateTime]::UtcNow
+            source = 'windows-ui-automation'
+        }
+    }
+    catch {
+        return $null
+    }
+}
 
 function Get-OverlaySnapshot {
     param([IntPtr]$Overlay)
@@ -282,6 +774,19 @@ function Get-OverlaySnapshot {
         [ref]$petBandLeft,
         [ref]$petBandRight
     )
+    $petBoundsSource = 'edge-fallback'
+    $automationMascot = $null
+    if ($null -ne $script:petAutomationLayout -and
+        $script:petAutomationLayout.overlay -eq $Overlay -and
+        $null -ne $script:petAutomationLayout.mascot -and
+        ($rect.Right - $rect.Left) -gt 0) {
+        $automationMascot = $script:petAutomationLayout.mascot
+        $petBandLeft = [Math]::Max(0.0, [Math]::Min(1.0,
+            ($automationMascot.left - $rect.Left) / [double]($rect.Right - $rect.Left)))
+        $petBandRight = [Math]::Max(0.0, [Math]::Min(1.0,
+            ($automationMascot.right - $rect.Left) / [double]($rect.Right - $rect.Left)))
+        $petBoundsSource = $script:petAutomationLayout.source
+    }
 
     [pscustomobject]@{
         overlay = $Overlay
@@ -299,6 +804,8 @@ function Get-OverlaySnapshot {
         noActivate = [bool](($extendedStyle -band 0x8000000) -ne 0)
         petBandLeft = $petBandLeft
         petBandRight = $petBandRight
+        petBoundsSource = $petBoundsSource
+        mascotBounds = $automationMascot
     }
 }
 
@@ -319,18 +826,92 @@ function Send-OverlayMouseMove {
     )
 }
 
+function Test-OverlayPoint {
+    param(
+        $Snapshot,
+        [int]$X,
+        [int]$Y
+    )
+
+    return $null -ne $Snapshot -and
+        $X -ge $Snapshot.left -and $X -lt ($Snapshot.left + $Snapshot.width) -and
+        $Y -ge $Snapshot.top -and $Y -lt ($Snapshot.top + $Snapshot.height)
+}
+
+function Test-PetControlPoint {
+    param(
+        $Snapshot,
+        [int]$X,
+        [int]$Y
+    )
+
+    if (-not (Test-OverlayPoint -Snapshot $Snapshot -X $X -Y $Y)) {
+        return $false
+    }
+
+    if ($null -ne $script:petAutomationLayout -and
+        $script:petAutomationLayout.overlay -eq $Snapshot.overlay) {
+        $mascot = $script:petAutomationLayout.mascot
+        if ($X -ge ($mascot.left - 6) -and $X -le ($mascot.right + 6) -and
+            $Y -ge ($mascot.top - 6) -and $Y -le ($mascot.bottom + 6)) {
+            return $true
+        }
+        foreach ($button in @($script:petAutomationLayout.buttons)) {
+            if ($X -ge ($button.left - 8) -and $X -le ($button.right + 8) -and
+                $Y -ge ($button.top - 8) -and $Y -le ($button.bottom + 8)) {
+                return $true
+            }
+        }
+        return $false
+    }
+
+    $localX = $X - $Snapshot.left
+    $localY = $Y - $Snapshot.top
+    return $localX -ge [Math]::Round($Snapshot.width * [Math]::Max(0.0, $Snapshot.petBandLeft - 0.06)) -and
+        $localX -le [Math]::Round($Snapshot.width * [Math]::Min(1.0, $Snapshot.petBandRight + 0.06)) -and
+        $localY -ge [Math]::Round($Snapshot.height * 0.45) -and
+        $localY -lt $Snapshot.height
+}
+
 function Test-PetControlZone {
     param($Snapshot)
 
     if ($null -eq $Snapshot -or -not $Snapshot.cursorInside) {
         return $false
     }
+    return Test-PetControlPoint -Snapshot $Snapshot -X $Snapshot.cursorX -Y $Snapshot.cursorY
+}
 
-    $localX = $Snapshot.cursorX - $Snapshot.left
-    $localY = $Snapshot.cursorY - $Snapshot.top
-    return $localX -ge [Math]::Round($Snapshot.width * [Math]::Max(0.0, $Snapshot.petBandLeft - 0.06)) -and
-        $localX -le [Math]::Round($Snapshot.width * [Math]::Min(1.0, $Snapshot.petBandRight + 0.06)) -and
-        $localY -ge [Math]::Round($Snapshot.height * 0.45) -and
+function Test-PetButtonPoint {
+    param(
+        $Snapshot,
+        [int]$X,
+        [int]$Y
+    )
+
+    if (-not (Test-OverlayPoint -Snapshot $Snapshot -X $X -Y $Y)) {
+        return $false
+    }
+
+    if ($null -ne $script:petAutomationLayout -and
+        $script:petAutomationLayout.overlay -eq $Snapshot.overlay) {
+        foreach ($button in @($script:petAutomationLayout.buttons)) {
+            if ($X -ge ($button.left - 8) -and $X -le ($button.right + 8) -and
+                $Y -ge ($button.top - 8) -and $Y -le ($button.bottom + 8)) {
+                return $true
+            }
+        }
+        $mascot = $script:petAutomationLayout.mascot
+        return $X -ge ($mascot.left - 18) -and $X -le ($mascot.right + 18) -and
+            $Y -ge ($mascot.bottom - 8) -and
+            $Y -lt ($Snapshot.top + $Snapshot.height)
+    }
+
+    $localX = $X - $Snapshot.left
+    $localY = $Y - $Snapshot.top
+    return $localX -ge [Math]::Round($Snapshot.width * [Math]::Max(0.0, $Snapshot.petBandLeft - 0.04)) -and
+        $localX -le [Math]::Round($Snapshot.width * [Math]::Min(1.0, $Snapshot.petBandRight + 0.04)) -and
+        $localY -ge [Math]::Round($Snapshot.height * 0.90) -and
         $localY -lt $Snapshot.height
 }
 
@@ -340,13 +921,37 @@ function Test-PetButtonZone {
     if ($null -eq $Snapshot -or -not $Snapshot.cursorInside) {
         return $false
     }
+    return Test-PetButtonPoint -Snapshot $Snapshot -X $Snapshot.cursorX -Y $Snapshot.cursorY
+}
 
-    $localX = $Snapshot.cursorX - $Snapshot.left
-    $localY = $Snapshot.cursorY - $Snapshot.top
-    return $localX -ge [Math]::Round($Snapshot.width * [Math]::Max(0.0, $Snapshot.petBandLeft - 0.04)) -and
-        $localX -le [Math]::Round($Snapshot.width * [Math]::Min(1.0, $Snapshot.petBandRight + 0.04)) -and
-        $localY -ge [Math]::Round($Snapshot.height * 0.90) -and
-        $localY -lt $Snapshot.height
+function Test-PetBodyPoint {
+    param(
+        $Snapshot,
+        [int]$X,
+        [int]$Y
+    )
+
+    if (-not (Test-OverlayPoint -Snapshot $Snapshot -X $X -Y $Y)) {
+        return $false
+    }
+
+    if ($null -ne $script:petAutomationLayout -and
+        $script:petAutomationLayout.overlay -eq $Snapshot.overlay) {
+        $mascot = $script:petAutomationLayout.mascot
+        return $X -ge ($mascot.left - 6) -and $X -le ($mascot.right + 6) -and
+            $Y -ge ($mascot.top - 6) -and $Y -le ($mascot.bottom + 6)
+    }
+
+    $localX = $X - $Snapshot.left
+    $localY = $Y - $Snapshot.top
+    # The visible character includes its head and hat well above the old
+    # lower-body-only band. Keep the body hit zone aligned with the complete
+    # interactive pet column so a head click cannot fall through to Codex's
+    # native single-click activation.
+    return $localX -ge [Math]::Round($Snapshot.width * [Math]::Max(0.0, $Snapshot.petBandLeft - 0.06)) -and
+        $localX -le [Math]::Round($Snapshot.width * [Math]::Min(1.0, $Snapshot.petBandRight + 0.06)) -and
+        $localY -ge [Math]::Round($Snapshot.height * 0.45) -and
+        $localY -lt [Math]::Round($Snapshot.height * 0.90)
 }
 
 function Test-PetBodyZone {
@@ -355,13 +960,41 @@ function Test-PetBodyZone {
     if ($null -eq $Snapshot -or -not $Snapshot.cursorInside) {
         return $false
     }
+    return Test-PetBodyPoint -Snapshot $Snapshot -X $Snapshot.cursorX -Y $Snapshot.cursorY
+}
 
-    $localX = $Snapshot.cursorX - $Snapshot.left
-    $localY = $Snapshot.cursorY - $Snapshot.top
-    return $localX -ge [Math]::Round($Snapshot.width * [Math]::Max(0.0, $Snapshot.petBandLeft - 0.02)) -and
-        $localX -le [Math]::Round($Snapshot.width * [Math]::Min(1.0, $Snapshot.petBandRight + 0.04)) -and
-        $localY -ge [Math]::Round($Snapshot.height * 0.62) -and
-        $localY -lt [Math]::Round($Snapshot.height * 0.90)
+function Update-PetBodyClickGuard {
+    param($Snapshot)
+
+    if ($null -eq $Snapshot -or $Snapshot.overlay -eq [IntPtr]::Zero) {
+        [ProfessorCluckshotInputNative]::ClearPetBodyClickGuard()
+        return
+    }
+
+    if ($null -ne $script:petAutomationLayout -and
+        $script:petAutomationLayout.overlay -eq $Snapshot.overlay -and
+        $null -ne $script:petAutomationLayout.mascot) {
+        $mascot = $script:petAutomationLayout.mascot
+        $guardLeft = [int]($mascot.left - 6)
+        $guardTop = [int]($mascot.top - 6)
+        $guardRight = [int]($mascot.right + 6)
+        $guardBottom = [int]($mascot.bottom + 6)
+    } else {
+        $guardLeft = [int]($Snapshot.left + [Math]::Round(
+            $Snapshot.width * [Math]::Max(0.0, $Snapshot.petBandLeft - 0.06)))
+        $guardRight = [int]($Snapshot.left + [Math]::Round(
+            $Snapshot.width * [Math]::Min(1.0, $Snapshot.petBandRight + 0.06)))
+        $guardTop = [int]($Snapshot.top + [Math]::Round($Snapshot.height * 0.45))
+        $guardBottom = [int]($Snapshot.top + [Math]::Round($Snapshot.height * 0.90))
+    }
+
+    [ProfessorCluckshotInputNative]::ConfigurePetBodyClickGuard(
+        $Snapshot.overlay,
+        $guardLeft,
+        $guardTop,
+        $guardRight,
+        $guardBottom
+    )
 }
 
 function Write-RelayState {
@@ -391,8 +1024,12 @@ function Write-PointerEventFile {
     $payload = [ordered]@{
         processId = $PID
         sessionId = $script:pointerEventSession
+        captureMode = $script:pointerCaptureMode
+        hookError = $script:pointerHookError
+        nativeClickDeflectionCount = [ProfessorCluckshotInputNative]::GetBodyClickDeflectionCount()
         sequence = $script:pointerEventSequence
         events = @($script:pointerEvents)
+        lastOverlayPointer = $script:lastOverlayPointer
     }
     $json = $payload | ConvertTo-Json -Depth 4 -Compress
     for ($attempt = 0; $attempt -lt 5; $attempt++) {
@@ -418,7 +1055,11 @@ function Publish-PetBodyClick {
         [datetime]$At,
         [int]$X,
         [int]$Y,
-        [IntPtr]$ForegroundBefore
+        [IntPtr]$ForegroundBefore,
+        [IntPtr]$ForegroundAtRelease = [IntPtr]::Zero,
+        [int]$ForegroundShowStateBefore = 0,
+        [bool]$NativeClickSuppressed = $false,
+        [bool]$NativeClickDeflected = $false
     )
 
     $script:pointerEventSequence++
@@ -429,6 +1070,10 @@ function Publish-PetBodyClick {
         x = $X
         y = $Y
         foregroundBefore = $ForegroundBefore.ToInt64()
+        foregroundAtRelease = $ForegroundAtRelease.ToInt64()
+        foregroundShowStateBefore = $ForegroundShowStateBefore
+        nativeClickSuppressed = $NativeClickSuppressed
+        nativeClickDeflected = $NativeClickDeflected
     }
     $script:pointerEvents = @($script:pointerEvents + $event | Select-Object -Last 8)
     $written = Write-PointerEventFile
@@ -449,6 +1094,18 @@ function Publish-PetBodyClick {
         }
         catch {
             # The 25 ms file poll remains the fallback if notification fails.
+        }
+    }
+
+    # This is only a state-preserving safety net. It never calls ShowWindow,
+    # changes maximize/minimize state, resizes a window, or emulates Alt-Tab.
+    if ($ForegroundBefore -ne [IntPtr]::Zero -and
+        [ProfessorCluckshotInputNative]::GetForegroundWindow() -ne $ForegroundBefore) {
+        try {
+            [void][ProfessorCluckshotInputNative]::RestoreForegroundWithoutChangingWindowState($ForegroundBefore)
+        }
+        catch {
+            # Speech delivery must survive a focus-policy restriction.
         }
     }
 }
@@ -514,6 +1171,7 @@ function Set-OverlayTransparent {
 
 if ($ProbeOnly) {
     $overlay = [ProfessorCluckshotInputNative]::FindOverlay()
+    $script:petAutomationLayout = Get-PetAutomationLayout -Overlay $overlay
     $snapshot = Get-OverlaySnapshot -Overlay $overlay
     [pscustomobject]@{
         overlayFound = $null -ne $snapshot
@@ -529,6 +1187,8 @@ if ($ProbeOnly) {
         noActivate = if ($null -ne $snapshot) { $snapshot.noActivate } else { $null }
         petBandLeft = if ($null -ne $snapshot) { $snapshot.petBandLeft } else { $null }
         petBandRight = if ($null -ne $snapshot) { $snapshot.petBandRight } else { $null }
+        petBoundsSource = if ($null -ne $snapshot) { $snapshot.petBoundsSource } else { $null }
+        mascotBounds = if ($null -ne $snapshot) { $snapshot.mascotBounds } else { $null }
         wouldPostWakeMessage = $null -ne $snapshot -and $snapshot.cursorInside -and $snapshot.transparent
     } | ConvertTo-Json -Compress
     exit 0
@@ -536,6 +1196,7 @@ if ($ProbeOnly) {
 
 $mutex = New-Object Threading.Mutex($false, 'Local\ProfessorCluckshotCodexPetInputBridge')
 $ownsMutex = $false
+$mouseHookStarted = $false
 try {
     try {
         $ownsMutex = $mutex.WaitOne(0)
@@ -572,17 +1233,41 @@ try {
     $bodyReleaseY = 0
     $bodyForegroundBefore = [IntPtr]::Zero
     $bodyReleaseForegroundBefore = [IntPtr]::Zero
+    $lastFallbackFastClickAt = [DateTime]::MinValue
+    $lastHookHealthAt = [DateTime]::MinValue
+    $lastAutomationLookup = [DateTime]::MinValue
     # Keep the foreground from the last idle polling tick. The native Codex
     # pet can activate its main window before the mouse-down tick is observed,
     # so GetForegroundWindow() on that tick may already be too late.
     $foregroundBeforeMouseDown = [ProfessorCluckshotInputNative]::GetForegroundWindow()
     $script:pointerEventPath = Join-Path $PSScriptRoot 'paper-cheer-pointer-events.json'
+    $bridgeErrorPath = Join-Path $PSScriptRoot 'codex-pet-input-bridge-error.json'
+    Remove-Item -LiteralPath $bridgeErrorPath -Force -ErrorAction SilentlyContinue
     $script:pointerEventSession = [Guid]::NewGuid().ToString('N')
     $script:pointerEventSequence = 0
     $script:pointerEvents = @()
+    $script:lastOverlayPointer = $null
+    $mouseHookStarted = [ProfessorCluckshotInputNative]::StartMouseHook()
+    $script:pointerCaptureMode = if ($mouseHookStarted) { 'low-level-hook' } else { 'poll-fallback' }
+    $script:pointerHookError = [ProfessorCluckshotInputNative]::GetMouseHookLastError()
     [void](Write-PointerEventFile)
 
     while ($true) {
+        $hookNow = [DateTime]::UtcNow
+        if (($hookNow - $lastHookHealthAt).TotalSeconds -ge 3) {
+            $lastHookHealthAt = $hookNow
+            if (-not [ProfessorCluckshotInputNative]::IsMouseHookActive()) {
+                $mouseHookStarted = [ProfessorCluckshotInputNative]::StartMouseHook()
+                $script:pointerCaptureMode = if ($mouseHookStarted) { 'low-level-hook' } else { 'poll-fallback' }
+                $script:pointerHookError = [ProfessorCluckshotInputNative]::GetMouseHookLastError()
+                [void](Write-PointerEventFile)
+            }
+        }
+        $hookEvents = @()
+        if ($mouseHookStarted) {
+            $hookEvents = @([ProfessorCluckshotInputNative]::DrainMouseHookEvents())
+        }
+
         if ($overlay -eq [IntPtr]::Zero -or -not [ProfessorCluckshotInputNative]::IsWindow($overlay)) {
             if (([DateTime]::UtcNow - $lastLookup).TotalMilliseconds -ge 500) {
                 $overlay = [ProfessorCluckshotInputNative]::FindOverlay()
@@ -590,8 +1275,23 @@ try {
             }
         }
 
+        if ($overlay -ne [IntPtr]::Zero -and
+            ($null -eq $script:petAutomationLayout -or
+             $script:petAutomationLayout.overlay -ne $overlay -or
+             ([DateTime]::UtcNow - $lastAutomationLookup).TotalMilliseconds -ge 100)) {
+            $lastAutomationLookup = [DateTime]::UtcNow
+            $freshAutomationLayout = Get-PetAutomationLayout -Overlay $overlay
+            if ($null -ne $freshAutomationLayout) {
+                $script:petAutomationLayout = $freshAutomationLayout
+            } elseif ($null -ne $script:petAutomationLayout -and
+                $script:petAutomationLayout.overlay -ne $overlay) {
+                $script:petAutomationLayout = $null
+            }
+        }
+
         $snapshot = Get-OverlaySnapshot -Overlay $overlay
         if ($null -eq $snapshot) {
+            [ProfessorCluckshotInputNative]::ClearPetBodyClickGuard()
             $forcedInteractive = $false
             $forcedOverlay = [IntPtr]::Zero
             $forcedOriginalStyle = 0
@@ -601,17 +1301,118 @@ try {
             $dragLastMotionAt = [DateTime]::MinValue
             $bodyClickArmed = $false
             $bodyReleaseCandidateAt = $null
+            $script:petAutomationLayout = $null
             $overlay = [IntPtr]::Zero
             Start-Sleep -Milliseconds 100
             continue
         }
+        Update-PetBodyClickGuard -Snapshot $snapshot
 
-        $leftButtonDown = (([int][ProfessorCluckshotInputNative]::GetAsyncKeyState(1) -band 0x8000) -ne 0)
+        $leftButtonState = [int][ProfessorCluckshotInputNative]::GetAsyncKeyState(1)
+        $leftButtonDown = (($leftButtonState -band 0x8000) -ne 0)
+        $leftButtonPressedSinceLastPoll = (($leftButtonState -band 0x0001) -ne 0)
         $inControlZone = Test-PetControlZone -Snapshot $snapshot
         $inPetBody = Test-PetBodyZone -Snapshot $snapshot
         $resumeBodyClick = $false
 
-        if ($null -ne $bodyReleaseCandidateAt) {
+        $overlayPointerDiagnosticChanged = $false
+        if ($mouseHookStarted -and $hookEvents.Count -gt 0) {
+            foreach ($hookEvent in $hookEvents) {
+                $hookMessage = [int]$hookEvent.Message
+                $hookX = [int]$hookEvent.X
+                $hookY = [int]$hookEvent.Y
+                $hookInOverlay = Test-OverlayPoint -Snapshot $snapshot -X $hookX -Y $hookY
+                $hookInBody = Test-PetBodyPoint -Snapshot $snapshot -X $hookX -Y $hookY
+                $hookInButton = Test-PetButtonPoint -Snapshot $snapshot -X $hookX -Y $hookY
+                $hookEventAt = [DateTime]::new([long]$hookEvent.UtcTicks, [DateTimeKind]::Utc)
+                $hookForegroundBefore = [IntPtr]::Zero
+                if ([long]$hookEvent.ForegroundBefore -ne 0) {
+                    $hookForegroundBefore = [IntPtr]::new([long]$hookEvent.ForegroundBefore)
+                }
+                $hookForegroundAtEvent = [IntPtr]::Zero
+                if ([long]$hookEvent.ForegroundAtEvent -ne 0) {
+                    $hookForegroundAtEvent = [IntPtr]::new([long]$hookEvent.ForegroundAtEvent)
+                }
+
+                if ($hookInOverlay -and ($hookMessage -eq 0x0201 -or $hookMessage -eq 0x0202)) {
+                    $script:lastOverlayPointer = [ordered]@{
+                        at = $hookEventAt.ToString('o')
+                        message = if ($hookMessage -eq 0x0201) { 'left-down' } else { 'left-up' }
+                        x = $hookX
+                        y = $hookY
+                        localX = $hookX - $snapshot.left
+                        localY = $hookY - $snapshot.top
+                        inBody = [bool]$hookInBody
+                        inButton = [bool]$hookInButton
+                        nativeClickSuppressed = [bool]$hookEvent.NativeClickSuppressed
+                        nativeClickDeflected = [bool]$hookEvent.NativeClickDeflected
+                        foregroundBefore = $hookForegroundBefore.ToInt64()
+                        foregroundAtEvent = $hookForegroundAtEvent.ToInt64()
+                        foregroundShowStateBefore = [int]$hookEvent.ForegroundShowStateBefore
+                        petBoundsSource = $snapshot.petBoundsSource
+                        mascotBounds = $snapshot.mascotBounds
+                    }
+                    $overlayPointerDiagnosticChanged = $true
+                }
+
+                if ($hookMessage -eq 0x0201 -and $hookInBody) {
+                    # The low-level hook records the real physical transition,
+                    # even when a quick click begins and ends between polling
+                    # ticks. It observes only and never blocks or injects input.
+                    $dragCaptureActive = $true
+                    $dragReleaseCandidateAt = $null
+                    $dragLastCursorX = $hookX
+                    $dragLastCursorY = $hookY
+                    $dragLastMotionAt = $hookEventAt
+                    $bodyClickArmed = $true
+                    $bodyDownX = $hookX
+                    $bodyDownY = $hookY
+                    $bodyMaxDistance = 0.0
+                    $bodyForegroundBefore = $hookForegroundBefore
+                    if ($bodyForegroundBefore -eq [IntPtr]::Zero) {
+                        $bodyForegroundBefore = $foregroundBeforeMouseDown
+                    }
+                    if ($bodyForegroundBefore -eq $overlay) {
+                        $bodyForegroundBefore = [IntPtr]::Zero
+                    }
+                    if ($bodyForegroundBefore -eq [IntPtr]::Zero) {
+                        $bodyForegroundBefore = [ProfessorCluckshotInputNative]::GetForegroundWindow()
+                    }
+                } elseif ($hookMessage -eq 0x0200 -and $bodyClickArmed) {
+                    $hookDistance = [Math]::Sqrt(
+                        [Math]::Pow($hookX - $bodyDownX, 2) +
+                        [Math]::Pow($hookY - $bodyDownY, 2)
+                    )
+                    $bodyMaxDistance = [Math]::Max($bodyMaxDistance, $hookDistance)
+                    $dragLastCursorX = $hookX
+                    $dragLastCursorY = $hookY
+                    $dragLastMotionAt = $hookEventAt
+                } elseif ($hookMessage -eq 0x0202 -and $bodyClickArmed) {
+                    $hookDistance = [Math]::Sqrt(
+                        [Math]::Pow($hookX - $bodyDownX, 2) +
+                        [Math]::Pow($hookY - $bodyDownY, 2)
+                    )
+                    $bodyMaxDistance = [Math]::Max($bodyMaxDistance, $hookDistance)
+                    if ($hookDistance -lt 16 -and $bodyMaxDistance -lt 16) {
+                        Publish-PetBodyClick `
+                            -At $hookEventAt `
+                            -X $hookX `
+                            -Y $hookY `
+                            -ForegroundBefore $bodyForegroundBefore `
+                            -ForegroundAtRelease $hookForegroundAtEvent `
+                            -ForegroundShowStateBefore ([int]$hookEvent.ForegroundShowStateBefore) `
+                            -NativeClickSuppressed ([bool]$hookEvent.NativeClickSuppressed) `
+                            -NativeClickDeflected ([bool]$hookEvent.NativeClickDeflected)
+                    }
+                    $bodyClickArmed = $false
+                }
+            }
+            if ($overlayPointerDiagnosticChanged) {
+                [void](Write-PointerEventFile)
+            }
+        }
+
+        if (-not $mouseHookStarted -and $null -ne $bodyReleaseCandidateAt) {
             $releaseAge = ([DateTime]::UtcNow - $bodyReleaseCandidateAt).TotalMilliseconds
             if ($leftButtonDown) {
                 # Ignore a sub-20 ms up/down glitch during a held drag. A real
@@ -629,7 +1430,7 @@ try {
             }
         }
 
-        if ($leftButtonDown -and -not $mouseWasDown -and ($inPetBody -or $resumeBodyClick)) {
+        if (-not $mouseHookStarted -and $leftButtonDown -and -not $mouseWasDown -and ($inPetBody -or $resumeBodyClick)) {
             # Once a body drag starts, keep the overlay interactive until the
             # physical mouse button is released. Otherwise crossing the
             # narrow pet hit band restores click-through mid-drag and the
@@ -651,11 +1452,6 @@ try {
                 if ($bodyForegroundBefore -eq [IntPtr]::Zero) {
                     $bodyForegroundBefore = [ProfessorCluckshotInputNative]::GetForegroundWindow()
                 }
-                # Undo the native pet's focus activation on mouse-down, before
-                # waiting for release and single/double-click classification.
-                if ($bodyForegroundBefore -ne [IntPtr]::Zero -and $bodyForegroundBefore -ne $overlay) {
-                    [void][ProfessorCluckshotInputNative]::RestoreForegroundWindow($bodyForegroundBefore)
-                }
             }
         }
 
@@ -667,7 +1463,7 @@ try {
             $bodyMaxDistance = [Math]::Max($bodyMaxDistance, $bodyCurrentDistance)
         }
 
-        if (-not $leftButtonDown -and $mouseWasDown -and $bodyClickArmed) {
+        if (-not $mouseHookStarted -and -not $leftButtonDown -and $mouseWasDown -and $bodyClickArmed) {
             $bodyDistance = [Math]::Sqrt(
                 [Math]::Pow($snapshot.cursorX - $bodyDownX, 2) +
                 [Math]::Pow($snapshot.cursorY - $bodyDownY, 2)
@@ -679,6 +1475,20 @@ try {
                 $bodyReleaseForegroundBefore = $bodyForegroundBefore
             }
             $bodyClickArmed = $false
+        }
+
+        if (-not $mouseHookStarted -and $leftButtonPressedSinceLastPoll -and
+            -not $leftButtonDown -and -not $mouseWasDown -and
+            -not $bodyClickArmed -and $inPetBody -and
+            ([DateTime]::UtcNow - $lastFallbackFastClickAt).TotalMilliseconds -ge 80) {
+            # GetAsyncKeyState's transition bit is a last-resort fallback when
+            # policy software prevents installing the low-level mouse hook.
+            $lastFallbackFastClickAt = [DateTime]::UtcNow
+            $fallbackForeground = $foregroundBeforeMouseDown
+            if ($fallbackForeground -eq $overlay) {
+                $fallbackForeground = [IntPtr]::Zero
+            }
+            Publish-PetBodyClick -At $lastFallbackFastClickAt -X $snapshot.cursorX -Y $snapshot.cursorY -ForegroundBefore $fallbackForeground
         }
         if ($dragCaptureActive) {
             $dragNow = [DateTime]::UtcNow
@@ -698,8 +1508,13 @@ try {
             }
         }
         $keepInteractive = $inControlZone -or $dragCaptureActive
-        $baselineStyle = (($snapshot.extendedStyle -bor 0x20) -bor 0x80000) -band (-bnot 0x8000000)
-        if (-not $baselineNormalized -and -not $keepInteractive) {
+        # Keep WS_EX_NOACTIVATE in both transparent and interactive states.
+        # A fast click can otherwise land before the hover poll changes styles
+        # and let the native pet raise the Codex main window.
+        $baselineStyle = (($snapshot.extendedStyle -bor 0x20) -bor 0x80000) -bor 0x8000000
+        $baselineNeedsRepair = -not $snapshot.transparent -or
+            -not $snapshot.layered -or -not $snapshot.noActivate
+        if (-not $keepInteractive -and (-not $baselineNormalized -or $baselineNeedsRepair)) {
             [void](Set-OverlayTransparent -Overlay $overlay -Enabled $true -ReferenceStyle $baselineStyle)
             $snapshot = Get-OverlaySnapshot -Overlay $overlay
             $baselineNormalized = $true
@@ -711,7 +1526,10 @@ try {
                 $forcedInteractive = $true
                 $forcedOverlay = $overlay
             }
-            [void](Set-OverlayTransparent -Overlay $overlay -Enabled $false -ReferenceStyle $forcedOriginalStyle -NoActivate ($inPetBody -or $dragCaptureActive))
+            # Every pet/control hit remains non-activating. Single-click speech
+            # never needs foreground activation; only the confirmed double-
+            # click path explicitly raises the Codex main window.
+            [void](Set-OverlayTransparent -Overlay $overlay -Enabled $false -ReferenceStyle $forcedOriginalStyle -NoActivate $true)
         } elseif ($forcedInteractive -and $forcedOverlay -eq $overlay) {
             [void](Set-OverlayTransparent -Overlay $overlay -Enabled $true -ReferenceStyle $forcedOriginalStyle)
             $forcedInteractive = $false
@@ -766,7 +1584,30 @@ try {
         [Threading.Thread]::Sleep($pollDelayMilliseconds)
     }
 }
+catch {
+    try {
+        $errorPath = Join-Path $PSScriptRoot 'codex-pet-input-bridge-error.json'
+        $errorState = [ordered]@{
+            at = (Get-Date).ToString('o')
+            message = [string]$_.Exception.Message
+            position = [string]$_.InvocationInfo.PositionMessage
+            processId = $PID
+        }
+        [System.IO.File]::WriteAllText(
+            $errorPath,
+            ($errorState | ConvertTo-Json -Depth 4),
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+    }
+    catch {
+        # Do not hide the original shutdown behind diagnostic I/O failure.
+    }
+}
 finally {
+    [ProfessorCluckshotInputNative]::ClearPetBodyClickGuard()
+    if ($mouseHookStarted -or [ProfessorCluckshotInputNative]::IsMouseHookActive()) {
+        [ProfessorCluckshotInputNative]::StopMouseHook()
+    }
     if ($forcedInteractive -and $forcedOverlay -ne [IntPtr]::Zero) {
         [void](Set-OverlayTransparent -Overlay $forcedOverlay -Enabled $true -ReferenceStyle $forcedOriginalStyle)
     }

@@ -278,10 +278,10 @@ namespace PaperCheer {
             }, IntPtr.Zero);
 
             if (best == IntPtr.Zero) return false;
-            return RestoreForegroundWindow(best);
+            return ActivateWindow(best);
         }
 
-        public static bool RestoreForegroundWindow(IntPtr window) {
+        private static bool ActivateWindow(IntPtr window) {
             if (window == IntPtr.Zero) return false;
             uint processId;
             IntPtr foreground = GetForegroundWindow();
@@ -374,6 +374,12 @@ $statePath = Join-Path $packageRoot 'paper-cheer-overlay-state.json'
 $lastMessagePath = Join-Path $packageRoot 'paper-cheer-last-message.json'
 $commandPath = Join-Path $packageRoot 'paper-cheer-command.json'
 $pointerEventPath = Join-Path $packageRoot 'paper-cheer-pointer-events.json'
+$inputBridgeScript = Join-Path $packageRoot 'CodexPetInputBridge.ps1'
+$inputBridgePidPath = Join-Path $packageRoot 'codex-pet-input-bridge.pid'
+$powershellExecutable = Join-Path $PSHOME 'powershell.exe'
+if (-not (Test-Path -LiteralPath $powershellExecutable -PathType Leaf)) {
+    $powershellExecutable = (Get-Command powershell.exe -ErrorAction Stop).Source
+}
 
 if (-not (Test-Path -LiteralPath $dialoguePath)) {
     throw "找不到台词库：$dialoguePath"
@@ -661,9 +667,9 @@ function Get-PetHitBounds {
         [ref]$petRightFraction
     )
     return [pscustomobject]@{
-        Left = $target.Left + [Math]::Round($width * [Math]::Max(0.0, $petLeftFraction - 0.02))
-        Right = $target.Left + [Math]::Round($width * [Math]::Min(1.0, $petRightFraction + 0.04))
-        Top = $target.Top + [Math]::Round($height * 0.62)
+        Left = $target.Left + [Math]::Round($width * [Math]::Max(0.0, $petLeftFraction - 0.06))
+        Right = $target.Left + [Math]::Round($width * [Math]::Min(1.0, $petRightFraction + 0.06))
+        Top = $target.Top + [Math]::Round($height * 0.45)
         Bottom = $target.Top + [Math]::Round($height * 0.90)
     }
 }
@@ -695,7 +701,8 @@ function Write-PetInteractionState {
         at = $At.ToString('o')
         registerCount = $script:interactionRegisterCount
         foregroundBeforeClick = $script:foregroundBeforePetClick.ToInt64()
-        restoreWindow = $script:pendingForegroundRestore.ToInt64()
+        restoreWindow = 0
+        focusPolicy = 'single-click-no-window-mutation'
         doubleClickMilliseconds = $script:doubleClickMilliseconds
         history = $script:interactionHistory
     }
@@ -718,15 +725,6 @@ function Register-PetClick {
         return
     }
 
-    if ($null -eq $script:pendingPetClickAt) {
-        # A new interaction supersedes the tail of the previous single-click
-        # foreground restoration. Otherwise that old timer can steal focus
-        # back immediately after a later double-click opens Codex.
-        $script:pendingForegroundRestore = [IntPtr]::Zero
-        $script:pendingForegroundRestoreAt = $null
-        $script:pendingForegroundRestoreStopAt = $null
-    }
-
     if ($null -ne $script:pendingPetClickAt) {
         $elapsed = ($At - $script:pendingPetClickAt).TotalMilliseconds
         $distance = [Math]::Sqrt(
@@ -735,9 +733,6 @@ function Register-PetClick {
         )
         if ($elapsed -le $script:doubleClickMilliseconds -and $distance -lt 16) {
             $script:pendingPetClickAt = $null
-            $script:pendingForegroundRestore = [IntPtr]::Zero
-            $script:pendingForegroundRestoreAt = $null
-            $script:pendingForegroundRestoreStopAt = $null
             # The native pet may emit one delayed relay more than two seconds
             # after a completed double-click. Ignore that tail event so it
             # cannot turn the successful double-click back into a single.
@@ -754,15 +749,6 @@ function Register-PetClick {
     $script:pendingPetClickY = $Y
     if ($ForegroundBefore -ne [IntPtr]::Zero) {
         $script:foregroundBeforePetClick = $ForegroundBefore
-    }
-    if ($script:foregroundBeforePetClick -ne [IntPtr]::Zero) {
-        $script:pendingForegroundRestore = $script:foregroundBeforePetClick
-        # The native pet raises Codex on its first click. Restore the window
-        # that was active before mouse-down immediately; the input bridge still
-        # sees a second physical click globally and double-click can raise Codex.
-        [void][PaperCheer.NativeWindow]::RestoreForegroundWindow($script:pendingForegroundRestore)
-        $script:pendingForegroundRestoreAt = (Get-Date).AddMilliseconds(75)
-        $script:pendingForegroundRestoreStopAt = $At.AddMilliseconds($script:doubleClickMilliseconds)
     }
     Write-PetInteractionState -Action 'pending-single' -At $At
 }
@@ -840,9 +826,6 @@ $script:pendingPetClickAt = $null
 $script:pendingPetClickX = 0
 $script:pendingPetClickY = 0
 $script:foregroundBeforePetClick = [IntPtr]::Zero
-$script:pendingForegroundRestore = [IntPtr]::Zero
-$script:pendingForegroundRestoreAt = $null
-$script:pendingForegroundRestoreStopAt = $null
 $script:ignorePetClicksUntil = [datetime]::MinValue
 $script:interactionRegisterCount = 0
 $script:interactionHistory = @()
@@ -879,25 +862,6 @@ $interactionTimer.Add_Tick({
         Show-PetInteraction -Trigger 'click'
         $script:lastPetClickAt = $now
         $script:lastPetHoverAt = $now
-        if ($script:pendingForegroundRestore -ne [IntPtr]::Zero) {
-            [void][PaperCheer.NativeWindow]::RestoreForegroundWindow($script:pendingForegroundRestore)
-            $script:pendingForegroundRestoreAt = $now.AddMilliseconds(75)
-            $script:pendingForegroundRestoreStopAt = $now.AddSeconds(2)
-        }
-    }
-
-    if ($script:pendingForegroundRestore -ne [IntPtr]::Zero -and
-        $null -ne $script:pendingForegroundRestoreAt -and
-        $now -ge $script:pendingForegroundRestoreAt) {
-        [void][PaperCheer.NativeWindow]::RestoreForegroundWindow($script:pendingForegroundRestore)
-        if ($null -ne $script:pendingForegroundRestoreStopAt -and
-            $now -ge $script:pendingForegroundRestoreStopAt) {
-            $script:pendingForegroundRestore = [IntPtr]::Zero
-            $script:pendingForegroundRestoreAt = $null
-            $script:pendingForegroundRestoreStopAt = $null
-        } else {
-            $script:pendingForegroundRestoreAt = $now.AddMilliseconds(75)
-        }
     }
 
     if ($overPet -and -not $leftButtonDown) {
@@ -942,6 +906,52 @@ $interactionTimer.Add_Tick({
 
 $autoTimer = New-Object System.Windows.Threading.DispatcherTimer
 $autoTimer.Interval = [TimeSpan]::FromSeconds(1)
+$script:lastInputBridgeHealthAt = [DateTime]::MinValue
+
+function Ensure-InputBridgeRunning {
+    $now = Get-Date
+    if (($now - $script:lastInputBridgeHealthAt).TotalSeconds -lt 3) {
+        return
+    }
+    $script:lastInputBridgeHealthAt = $now
+
+    $bridgeProcessId = 0
+    if (Test-Path -LiteralPath $inputBridgePidPath -PathType Leaf) {
+        try {
+            $bridgeProcessIdText = (Get-Content -LiteralPath $inputBridgePidPath -Raw -Encoding UTF8).Trim()
+            if ($bridgeProcessIdText -match '^\d+$') {
+                $bridgeProcessId = [int]$bridgeProcessIdText
+            }
+        }
+        catch {
+            $bridgeProcessId = 0
+        }
+    }
+
+    if ($bridgeProcessId -gt 0) {
+        $bridgeProcess = Get-Process -Id $bridgeProcessId -ErrorAction SilentlyContinue
+        if ($null -ne $bridgeProcess -and @('powershell','pwsh') -contains $bridgeProcess.ProcessName) {
+            return
+        }
+    }
+
+    try {
+        $arguments = @(
+            '-NoProfile',
+            '-ExecutionPolicy', 'Bypass',
+            '-File', ('"{0}"' -f $inputBridgeScript)
+        )
+        $bridgeProcess = Start-Process -FilePath $powershellExecutable -ArgumentList $arguments -WindowStyle Hidden -PassThru
+        [System.IO.File]::WriteAllText(
+            $inputBridgePidPath,
+            [string]$bridgeProcess.Id,
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+    }
+    catch {
+        # Retry on the next health tick without interrupting speech.
+    }
+}
 
 function Show-Message {
     param(
@@ -994,6 +1004,7 @@ $hideTimer.Add_Tick({
 
 $script:nextAt = (Get-Date).AddSeconds((Get-Random -Minimum $MinIntervalSeconds -Maximum ($MaxIntervalSeconds + 1)))
 $autoTimer.Add_Tick({
+    Ensure-InputBridgeRunning
     $manualCommand = Take-ManualCommand
     if ($null -ne $manualCommand) {
         $manualTrigger = [string]$manualCommand.trigger
