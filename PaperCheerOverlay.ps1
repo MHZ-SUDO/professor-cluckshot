@@ -278,13 +278,7 @@ namespace PaperCheer {
             }, IntPtr.Zero);
 
             if (best == IntPtr.Zero) return false;
-            ShowWindowAsync(best, 9);
-            if (SetForegroundWindow(best)) return true;
-            // Windows can reject SetForegroundWindow for a non-foreground
-            // helper process. This is the same user-initiated switch used by
-            // the taskbar and reliably handles the double-click action.
-            SwitchToThisWindow(best, true);
-            return true;
+            return RestoreForegroundWindow(best);
         }
 
         public static bool RestoreForegroundWindow(IntPtr window) {
@@ -714,6 +708,15 @@ function Register-PetClick {
         return
     }
 
+    if ($null -eq $script:pendingPetClickAt) {
+        # A new interaction supersedes the tail of the previous single-click
+        # foreground restoration. Otherwise that old timer can steal focus
+        # back immediately after a later double-click opens Codex.
+        $script:pendingForegroundRestore = [IntPtr]::Zero
+        $script:pendingForegroundRestoreAt = $null
+        $script:pendingForegroundRestoreStopAt = $null
+    }
+
     if ($null -ne $script:pendingPetClickAt) {
         $elapsed = ($At - $script:pendingPetClickAt).TotalMilliseconds
         $distance = [Math]::Sqrt(
@@ -725,7 +728,10 @@ function Register-PetClick {
             $script:pendingForegroundRestore = [IntPtr]::Zero
             $script:pendingForegroundRestoreAt = $null
             $script:pendingForegroundRestoreStopAt = $null
-            $script:ignorePetClicksUntil = $At.AddSeconds(2)
+            # The native pet may emit one delayed relay more than two seconds
+            # after a completed double-click. Ignore that tail event so it
+            # cannot turn the successful double-click back into a single.
+            $script:ignorePetClicksUntil = $At.AddSeconds(3)
             $script:lastPetClickAt = $At
             Write-PetInteractionState -Action 'double' -At $At
             [void][PaperCheer.NativeWindow]::ActivateCodexMainWindow()
