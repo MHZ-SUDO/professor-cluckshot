@@ -446,6 +446,11 @@ try {
     $forcedOriginalStyle = 0
     $baselineNormalized = $false
     $mouseWasDown = $false
+    $dragCaptureActive = $false
+    $dragReleaseCandidateAt = $null
+    $dragLastCursorX = 0
+    $dragLastCursorY = 0
+    $dragLastMotionAt = [DateTime]::MinValue
     $syntheticClickPending = $false
     $syntheticDownX = 0
     $syntheticDownY = 0
@@ -464,27 +469,60 @@ try {
             $forcedOverlay = [IntPtr]::Zero
             $forcedOriginalStyle = 0
             $baselineNormalized = $false
+            $dragCaptureActive = $false
+            $dragReleaseCandidateAt = $null
+            $dragLastMotionAt = [DateTime]::MinValue
             $overlay = [IntPtr]::Zero
             Start-Sleep -Milliseconds 100
             continue
         }
 
+        $leftButtonDown = (([int][ProfessorCluckshotInputNative]::GetAsyncKeyState(1) -band 0x8000) -ne 0)
         $inControlZone = Test-PetControlZone -Snapshot $snapshot
         $inPetBody = Test-PetBodyZone -Snapshot $snapshot
+        if ($leftButtonDown -and -not $mouseWasDown -and $inPetBody) {
+            # Once a body drag starts, keep the overlay interactive until the
+            # physical mouse button is released. Otherwise crossing the
+            # narrow pet hit band restores click-through mid-drag and the
+            # native Codex window loses its drag capture.
+            $dragCaptureActive = $true
+            $dragReleaseCandidateAt = $null
+            $dragLastCursorX = $snapshot.cursorX
+            $dragLastCursorY = $snapshot.cursorY
+            $dragLastMotionAt = [DateTime]::UtcNow
+        }
+        if ($dragCaptureActive) {
+            $dragNow = [DateTime]::UtcNow
+            if ($snapshot.cursorX -ne $dragLastCursorX -or $snapshot.cursorY -ne $dragLastCursorY) {
+                $dragLastCursorX = $snapshot.cursorX
+                $dragLastCursorY = $snapshot.cursorY
+                $dragLastMotionAt = $dragNow
+            }
+            $recentDragMotion = ($dragNow - $dragLastMotionAt).TotalMilliseconds -lt 80
+            if ($leftButtonDown -or $recentDragMotion) {
+                $dragReleaseCandidateAt = $null
+            } elseif ($null -eq $dragReleaseCandidateAt) {
+                $dragReleaseCandidateAt = $dragNow
+            } elseif (($dragNow - $dragReleaseCandidateAt).TotalMilliseconds -ge 250) {
+                $dragCaptureActive = $false
+                $dragReleaseCandidateAt = $null
+            }
+        }
+        $keepInteractive = $inControlZone -or $dragCaptureActive
         $baselineStyle = (($snapshot.extendedStyle -bor 0x20) -bor 0x80000) -band (-bnot 0x8000000)
-        if (-not $baselineNormalized -and -not $inControlZone) {
+        if (-not $baselineNormalized -and -not $keepInteractive) {
             [void](Set-OverlayTransparent -Overlay $overlay -Enabled $true -ReferenceStyle $baselineStyle)
             $snapshot = Get-OverlaySnapshot -Overlay $overlay
             $baselineNormalized = $true
         }
-        if ($inControlZone) {
+        if ($keepInteractive) {
             if (-not $forcedInteractive -or $forcedOverlay -ne $overlay) {
                 $forcedOriginalStyle = $baselineStyle
                 $baselineNormalized = $true
                 $forcedInteractive = $true
                 $forcedOverlay = $overlay
             }
-            [void](Set-OverlayTransparent -Overlay $overlay -Enabled $false -ReferenceStyle $forcedOriginalStyle -NoActivate $inPetBody)
+            [void](Set-OverlayTransparent -Overlay $overlay -Enabled $false -ReferenceStyle $forcedOriginalStyle -NoActivate ($inPetBody -or $dragCaptureActive))
         } elseif ($forcedInteractive -and $forcedOverlay -eq $overlay) {
             [void](Set-OverlayTransparent -Overlay $overlay -Enabled $true -ReferenceStyle $forcedOriginalStyle)
             $forcedInteractive = $false
@@ -494,7 +532,6 @@ try {
 
         [void](Send-OverlayMouseMove -Snapshot $snapshot)
 
-        $leftButtonDown = (([int][ProfessorCluckshotInputNative]::GetAsyncKeyState(1) -band 0x8000) -ne 0)
         if ($leftButtonDown -and -not $mouseWasDown -and (Test-PetButtonZone -Snapshot $snapshot)) {
             $renderer = [ProfessorCluckshotInputNative]::FindRenderer($overlay)
             $hit = [ProfessorCluckshotInputNative]::WindowFromPoint(
@@ -530,8 +567,8 @@ try {
         }
 
         $mouseWasDown = $leftButtonDown
-        $pollDelayMilliseconds = if ($inControlZone) { 2 } else { 15 }
-        Start-Sleep -Milliseconds $pollDelayMilliseconds
+        $pollDelayMilliseconds = if ($dragCaptureActive) { 1 } elseif ($keepInteractive) { 2 } else { 15 }
+        [Threading.Thread]::Sleep($pollDelayMilliseconds)
     }
 }
 finally {
