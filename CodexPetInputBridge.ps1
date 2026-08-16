@@ -72,6 +72,8 @@ public static class ProfessorCluckshotInputNative
         public int ForegroundShowStateBefore { get; set; }
         public bool NativeClickSuppressed { get; set; }
         public bool NativeClickDeflected { get; set; }
+        public bool BodyGestureOwned { get; set; }
+        public bool BodyDragStarted { get; set; }
     }
 
     private delegate IntPtr LowLevelMouseProc(int code, IntPtr wParam, IntPtr lParam);
@@ -212,11 +214,12 @@ public static class ProfessorCluckshotInputNative
     private const int WM_MOUSEMOVE = 0x0200;
     private const int WM_LBUTTONDOWN = 0x0201;
     private const int WM_LBUTTONUP = 0x0202;
-    private const uint WM_CANCELMODE = 0x001F;
     private const uint WM_QUIT = 0x0012;
-    private const long WS_EX_TRANSPARENT = 0x00000020L;
-    private const long WS_EX_LAYERED = 0x00080000L;
-    private const long WS_EX_NOACTIVATE = 0x08000000L;
+    private const long BODY_DRAG_THRESHOLD_SQUARED = 64L;
+    private const uint SWP_NOSIZE = 0x0001;
+    private const uint SWP_NOZORDER = 0x0004;
+    private const uint SWP_NOACTIVATE = 0x0010;
+    private const uint SWP_ASYNCWINDOWPOS = 0x4000;
 
     private static readonly object MouseHookSync = new object();
     private static readonly ConcurrentQueue<MouseHookEventRecord> MouseHookEvents =
@@ -240,7 +243,15 @@ public static class ProfessorCluckshotInputNative
     private static long MouseBodyMaxDistanceSquared;
     private static long MouseBodyForegroundBefore;
     private static int MouseBodyForegroundShowStateBefore;
-    private static int MouseBodyClickDeflectionCount;
+    private static int MouseBodyOverlayStartLeft;
+    private static int MouseBodyOverlayStartTop;
+    private static int MouseBodyGuardStartLeft;
+    private static int MouseBodyGuardStartTop;
+    private static int MouseBodyGuardStartRight;
+    private static int MouseBodyGuardStartBottom;
+    private static bool MouseBodyOverlayPositionValid;
+    private static bool MouseBodyDragStarted;
+    private static int MouseBodyInputSuppressionCount;
 
     public static bool StartMouseHook()
     {
@@ -318,9 +329,9 @@ public static class ProfessorCluckshotInputNative
         MouseBodyGestureActive = false;
     }
 
-    public static int GetBodyClickDeflectionCount()
+    public static int GetBodyInputSuppressionCount()
     {
-        return Volatile.Read(ref MouseBodyClickDeflectionCount);
+        return Volatile.Read(ref MouseBodyInputSuppressionCount);
     }
 
     public static void StopMouseHook()
@@ -407,31 +418,47 @@ public static class ProfessorCluckshotInputNative
         return 1;
     }
 
-    private static void CancelNativeBodyClick(IntPtr overlay, POINT point)
+    private static void UpdateOwnedBodyGesturePosition(IntPtr overlay, POINT point)
     {
-        IntPtr hit = WindowFromPoint(point);
-        if (hit != IntPtr.Zero)
+        long deltaX = point.X - MouseBodyStartX;
+        long deltaY = point.Y - MouseBodyStartY;
+        long distanceSquared = (deltaX * deltaX) + (deltaY * deltaY);
+        if (distanceSquared > MouseBodyMaxDistanceSquared)
         {
-            PostMessage(hit, WM_CANCELMODE, IntPtr.Zero, IntPtr.Zero);
+            MouseBodyMaxDistanceSquared = distanceSquared;
         }
-        if (overlay != IntPtr.Zero && overlay != hit)
-        {
-            PostMessage(overlay, WM_CANCELMODE, IntPtr.Zero, IntPtr.Zero);
-        }
-    }
 
-    private static void DeflectNativeBodyClickRelease(IntPtr overlay)
-    {
-        if (overlay == IntPtr.Zero || !IsWindow(overlay)) return;
-        long style = GetWindowLongPtr(overlay, -20).ToInt64();
-        style |= WS_EX_TRANSPARENT | WS_EX_LAYERED | WS_EX_NOACTIVATE;
-        SetWindowLongPtr(overlay, -20, new IntPtr(style));
-        SetWindowPos(overlay, IntPtr.Zero, 0, 0, 0, 0, 0x0027);
+        if (MouseBodyMaxDistanceSquared < BODY_DRAG_THRESHOLD_SQUARED)
+        {
+            return;
+        }
+
+        MouseBodyDragStarted = true;
+        if (!MouseBodyOverlayPositionValid || overlay == IntPtr.Zero || !IsWindow(overlay))
+        {
+            return;
+        }
+
+        int translatedX = (int)deltaX;
+        int translatedY = (int)deltaY;
+        Volatile.Write(ref MouseGuardLeft, MouseBodyGuardStartLeft + translatedX);
+        Volatile.Write(ref MouseGuardTop, MouseBodyGuardStartTop + translatedY);
+        Volatile.Write(ref MouseGuardRight, MouseBodyGuardStartRight + translatedX);
+        Volatile.Write(ref MouseGuardBottom, MouseBodyGuardStartBottom + translatedY);
+        SetWindowPos(
+            overlay,
+            IntPtr.Zero,
+            MouseBodyOverlayStartLeft + translatedX,
+            MouseBodyOverlayStartTop + translatedY,
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS
+        );
     }
 
     private static IntPtr MouseHookCallback(int code, IntPtr wParam, IntPtr lParam)
     {
-        bool deflectNativeClick = false;
+        bool suppressNativeTransition = false;
         if (code >= 0)
         {
             int message = wParam.ToInt32();
@@ -444,49 +471,47 @@ public static class ProfessorCluckshotInputNative
                     typeof(MSLLHOOKSTRUCT)
                 );
                 IntPtr guardedOverlay = IntPtr.Zero;
+                bool bodyGestureOwned = MouseBodyGestureActive;
                 if (message == WM_LBUTTONDOWN)
                 {
                     MouseLeftButtonHeld = true;
                     MouseBodyGestureActive = PointInsideBodyGuard(data.Point, out guardedOverlay);
+                    bodyGestureOwned = MouseBodyGestureActive;
                     if (MouseBodyGestureActive)
                     {
                         MouseBodyStartX = data.Point.X;
                         MouseBodyStartY = data.Point.Y;
                         MouseBodyMaxDistanceSquared = 0L;
+                        MouseBodyDragStarted = false;
                         MouseBodyForegroundBefore = GetForegroundWindow().ToInt64();
                         MouseBodyForegroundShowStateBefore = GetWindowShowState(
                             new IntPtr(MouseBodyForegroundBefore)
                         );
+                        MouseBodyGuardStartLeft = Volatile.Read(ref MouseGuardLeft);
+                        MouseBodyGuardStartTop = Volatile.Read(ref MouseGuardTop);
+                        MouseBodyGuardStartRight = Volatile.Read(ref MouseGuardRight);
+                        MouseBodyGuardStartBottom = Volatile.Read(ref MouseGuardBottom);
+                        RECT overlayRect;
+                        MouseBodyOverlayPositionValid = GetWindowRect(guardedOverlay, out overlayRect);
+                        if (MouseBodyOverlayPositionValid)
+                        {
+                            MouseBodyOverlayStartLeft = overlayRect.Left;
+                            MouseBodyOverlayStartTop = overlayRect.Top;
+                        }
                     }
                 }
                 else if (message == WM_MOUSEMOVE && MouseBodyGestureActive)
                 {
-                    long deltaX = data.Point.X - MouseBodyStartX;
-                    long deltaY = data.Point.Y - MouseBodyStartY;
-                    long distanceSquared = (deltaX * deltaX) + (deltaY * deltaY);
-                    if (distanceSquared > MouseBodyMaxDistanceSquared)
-                    {
-                        MouseBodyMaxDistanceSquared = distanceSquared;
-                    }
+                    guardedOverlay = new IntPtr(Interlocked.Read(ref MouseGuardOverlayHandle));
+                    UpdateOwnedBodyGesturePosition(guardedOverlay, data.Point);
                 }
                 else if (message == WM_LBUTTONUP && MouseBodyGestureActive)
                 {
-                    long deltaX = data.Point.X - MouseBodyStartX;
-                    long deltaY = data.Point.Y - MouseBodyStartY;
-                    long distanceSquared = (deltaX * deltaX) + (deltaY * deltaY);
-                    if (distanceSquared > MouseBodyMaxDistanceSquared)
-                    {
-                        MouseBodyMaxDistanceSquared = distanceSquared;
-                    }
-                    deflectNativeClick = MouseBodyMaxDistanceSquared < 256L;
                     guardedOverlay = new IntPtr(Interlocked.Read(ref MouseGuardOverlayHandle));
-                    if (deflectNativeClick)
-                    {
-                        CancelNativeBodyClick(guardedOverlay, data.Point);
-                        DeflectNativeBodyClickRelease(guardedOverlay);
-                        Interlocked.Increment(ref MouseBodyClickDeflectionCount);
-                    }
+                    UpdateOwnedBodyGesturePosition(guardedOverlay, data.Point);
                 }
+                suppressNativeTransition = bodyGestureOwned &&
+                    (message == WM_LBUTTONDOWN || message == WM_LBUTTONUP);
                 MouseHookEvents.Enqueue(new MouseHookEventRecord
                 {
                     Message = message,
@@ -498,19 +523,30 @@ public static class ProfessorCluckshotInputNative
                     ForegroundShowStateBefore = MouseBodyGestureActive
                         ? MouseBodyForegroundShowStateBefore
                         : 0,
-                    NativeClickSuppressed = false,
-                    NativeClickDeflected = deflectNativeClick
+                    NativeClickSuppressed = suppressNativeTransition,
+                    NativeClickDeflected = false,
+                    BodyGestureOwned = bodyGestureOwned,
+                    BodyDragStarted = bodyGestureOwned && MouseBodyDragStarted
                 });
+                if (suppressNativeTransition)
+                {
+                    Interlocked.Increment(ref MouseBodyInputSuppressionCount);
+                }
                 if (message == WM_LBUTTONUP)
                 {
                     MouseLeftButtonHeld = false;
                     MouseBodyGestureActive = false;
+                    MouseBodyOverlayPositionValid = false;
                 }
             }
         }
-        // Never swallow the physical mouse-up. The native window receives a
-        // normal release (or the window underneath receives it after the
-        // temporary click-through switch), so drag capture cannot stick.
+        // Own both ends of a mascot-body gesture. The native Codex pet never
+        // receives an unmatched mouse-down, while ordinary mouse moves keep
+        // flowing so the pointer remains under the user's control.
+        if (suppressNativeTransition)
+        {
+            return new IntPtr(1);
+        }
         return CallNextHookEx(MouseHookHandle, code, wParam, lParam);
     }
 
@@ -1026,7 +1062,7 @@ function Write-PointerEventFile {
         sessionId = $script:pointerEventSession
         captureMode = $script:pointerCaptureMode
         hookError = $script:pointerHookError
-        nativeClickDeflectionCount = [ProfessorCluckshotInputNative]::GetBodyClickDeflectionCount()
+        nativeBodyInputSuppressionCount = [ProfessorCluckshotInputNative]::GetBodyInputSuppressionCount()
         sequence = $script:pointerEventSequence
         events = @($script:pointerEvents)
         lastOverlayPointer = $script:lastOverlayPointer
@@ -1228,6 +1264,7 @@ try {
     $bodyDownX = 0
     $bodyDownY = 0
     $bodyMaxDistance = 0.0
+    $bodyDragStarted = $false
     $bodyReleaseCandidateAt = $null
     $bodyReleaseX = 0
     $bodyReleaseY = 0
@@ -1300,6 +1337,7 @@ try {
             $dragReleaseCandidateAt = $null
             $dragLastMotionAt = [DateTime]::MinValue
             $bodyClickArmed = $false
+            $bodyDragStarted = $false
             $bodyReleaseCandidateAt = $null
             $script:petAutomationLayout = $null
             $overlay = [IntPtr]::Zero
@@ -1312,6 +1350,7 @@ try {
         $leftButtonDown = (($leftButtonState -band 0x8000) -ne 0)
         $leftButtonPressedSinceLastPoll = (($leftButtonState -band 0x0001) -ne 0)
         $inControlZone = Test-PetControlZone -Snapshot $snapshot
+        $inButtonZone = Test-PetButtonZone -Snapshot $snapshot
         $inPetBody = Test-PetBodyZone -Snapshot $snapshot
         $resumeBodyClick = $false
 
@@ -1333,8 +1372,11 @@ try {
                 if ([long]$hookEvent.ForegroundAtEvent -ne 0) {
                     $hookForegroundAtEvent = [IntPtr]::new([long]$hookEvent.ForegroundAtEvent)
                 }
+                $hookBodyGestureOwned = [bool]$hookEvent.BodyGestureOwned
+                $hookBodyDragStarted = [bool]$hookEvent.BodyDragStarted
 
-                if ($hookInOverlay -and ($hookMessage -eq 0x0201 -or $hookMessage -eq 0x0202)) {
+                if (($hookInOverlay -or $hookBodyGestureOwned) -and
+                    ($hookMessage -eq 0x0201 -or $hookMessage -eq 0x0202)) {
                     $script:lastOverlayPointer = [ordered]@{
                         at = $hookEventAt.ToString('o')
                         message = if ($hookMessage -eq 0x0201) { 'left-down' } else { 'left-up' }
@@ -1346,6 +1388,8 @@ try {
                         inButton = [bool]$hookInButton
                         nativeClickSuppressed = [bool]$hookEvent.NativeClickSuppressed
                         nativeClickDeflected = [bool]$hookEvent.NativeClickDeflected
+                        bodyGestureOwned = $hookBodyGestureOwned
+                        bodyDragStarted = $hookBodyDragStarted
                         foregroundBefore = $hookForegroundBefore.ToInt64()
                         foregroundAtEvent = $hookForegroundAtEvent.ToInt64()
                         foregroundShowStateBefore = [int]$hookEvent.ForegroundShowStateBefore
@@ -1355,10 +1399,10 @@ try {
                     $overlayPointerDiagnosticChanged = $true
                 }
 
-                if ($hookMessage -eq 0x0201 -and $hookInBody) {
-                    # The low-level hook records the real physical transition,
-                    # even when a quick click begins and ends between polling
-                    # ticks. It observes only and never blocks or injects input.
+                if ($hookMessage -eq 0x0201 -and $hookBodyGestureOwned) {
+                    # The helper owns both physical transitions for the mascot
+                    # body. Native Codex receives neither end, so it cannot
+                    # retain a drag after a single click.
                     $dragCaptureActive = $true
                     $dragReleaseCandidateAt = $null
                     $dragLastCursorX = $hookX
@@ -1368,6 +1412,7 @@ try {
                     $bodyDownX = $hookX
                     $bodyDownY = $hookY
                     $bodyMaxDistance = 0.0
+                    $bodyDragStarted = $false
                     $bodyForegroundBefore = $hookForegroundBefore
                     if ($bodyForegroundBefore -eq [IntPtr]::Zero) {
                         $bodyForegroundBefore = $foregroundBeforeMouseDown
@@ -1378,22 +1423,24 @@ try {
                     if ($bodyForegroundBefore -eq [IntPtr]::Zero) {
                         $bodyForegroundBefore = [ProfessorCluckshotInputNative]::GetForegroundWindow()
                     }
-                } elseif ($hookMessage -eq 0x0200 -and $bodyClickArmed) {
+                } elseif ($hookMessage -eq 0x0200 -and $bodyClickArmed -and $hookBodyGestureOwned) {
                     $hookDistance = [Math]::Sqrt(
                         [Math]::Pow($hookX - $bodyDownX, 2) +
                         [Math]::Pow($hookY - $bodyDownY, 2)
                     )
                     $bodyMaxDistance = [Math]::Max($bodyMaxDistance, $hookDistance)
+                    $bodyDragStarted = $bodyDragStarted -or $hookBodyDragStarted
                     $dragLastCursorX = $hookX
                     $dragLastCursorY = $hookY
                     $dragLastMotionAt = $hookEventAt
-                } elseif ($hookMessage -eq 0x0202 -and $bodyClickArmed) {
+                } elseif ($hookMessage -eq 0x0202 -and $bodyClickArmed -and $hookBodyGestureOwned) {
                     $hookDistance = [Math]::Sqrt(
                         [Math]::Pow($hookX - $bodyDownX, 2) +
                         [Math]::Pow($hookY - $bodyDownY, 2)
                     )
                     $bodyMaxDistance = [Math]::Max($bodyMaxDistance, $hookDistance)
-                    if ($hookDistance -lt 16 -and $bodyMaxDistance -lt 16) {
+                    $bodyDragStarted = $bodyDragStarted -or $hookBodyDragStarted
+                    if (-not $bodyDragStarted -and $hookDistance -lt 8 -and $bodyMaxDistance -lt 8) {
                         Publish-PetBodyClick `
                             -At $hookEventAt `
                             -X $hookX `
@@ -1405,11 +1452,32 @@ try {
                             -NativeClickDeflected ([bool]$hookEvent.NativeClickDeflected)
                     }
                     $bodyClickArmed = $false
+                    $dragCaptureActive = $false
+                    $dragReleaseCandidateAt = $null
+                    if ($bodyDragStarted) {
+                        # UI Automation bounds are absolute screen coordinates;
+                        # invalidate them after an externally moved pet window.
+                        $script:petAutomationLayout = $null
+                        $lastAutomationLookup = [DateTime]::MinValue
+                    }
+                    $bodyDragStarted = $false
                 }
             }
             if ($overlayPointerDiagnosticChanged) {
                 [void](Write-PointerEventFile)
             }
+        }
+
+        if ($mouseHookStarted -and $bodyClickArmed -and -not $leftButtonDown) {
+            # Fail closed if Windows ever drops the queued release record. The
+            # native pet never saw the down, and the helper must stop moving it
+            # as soon as the physical button is no longer held.
+            $bodyClickArmed = $false
+            $bodyDragStarted = $false
+            $dragCaptureActive = $false
+            $dragReleaseCandidateAt = $null
+            $script:petAutomationLayout = $null
+            $lastAutomationLookup = [DateTime]::MinValue
         }
 
         if (-not $mouseHookStarted -and $null -ne $bodyReleaseCandidateAt) {
@@ -1490,7 +1558,7 @@ try {
             }
             Publish-PetBodyClick -At $lastFallbackFastClickAt -X $snapshot.cursorX -Y $snapshot.cursorY -ForegroundBefore $fallbackForeground
         }
-        if ($dragCaptureActive) {
+        if ($dragCaptureActive -and -not $mouseHookStarted) {
             $dragNow = [DateTime]::UtcNow
             if ($snapshot.cursorX -ne $dragLastCursorX -or $snapshot.cursorY -ne $dragLastCursorY) {
                 $dragLastCursorX = $snapshot.cursorX
@@ -1507,7 +1575,13 @@ try {
                 $dragReleaseCandidateAt = $null
             }
         }
-        $keepInteractive = $inControlZone -or $dragCaptureActive
+        $keepInteractive = if ($mouseHookStarted) {
+            # The hook owns mascot-body gestures; only the two round controls
+            # need native hit testing while the hook is healthy.
+            $inButtonZone
+        } else {
+            $inControlZone -or $dragCaptureActive
+        }
         # Keep WS_EX_NOACTIVATE in both transparent and interactive states.
         # A fast click can otherwise land before the hover poll changes styles
         # and let the native pet raise the Codex main window.
