@@ -31,6 +31,8 @@ if ($MaxIntervalSeconds -lt $MinIntervalSeconds) {
 
 Add-Type -AssemblyName PresentationFramework
 Add-Type -AssemblyName WindowsBase
+Add-Type -AssemblyName UIAutomationClient
+Add-Type -AssemblyName UIAutomationTypes
 
 if (-not ('PaperCheer.NativeWindow' -as [type])) {
     Add-Type -TypeDefinition @'
@@ -92,6 +94,12 @@ namespace PaperCheer {
 
         [DllImport("user32.dll")]
         private static extern bool GetMonitorInfo(IntPtr monitor, ref MONITORINFO info);
+
+        [DllImport("user32.dll")]
+        private static extern uint GetDpiForWindow(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr SetThreadDpiAwarenessContext(IntPtr dpiContext);
 
         [DllImport("user32.dll")]
         private static extern bool SetWindowPos(
@@ -363,6 +371,73 @@ namespace PaperCheer {
             // so wide text or an animated pose can never cover the character.
             return SetWindowPos(bubble, petWindow, left, top, 0, 0, 0x0011);
         }
+
+        public static int GetWindowDpiValue(IntPtr window) {
+            uint dpi = window == IntPtr.Zero ? 0 : GetDpiForWindow(window);
+            return dpi == 0 ? 96 : (int)dpi;
+        }
+
+        public static bool PositionBubbleNearBounds(IntPtr bubble, IntPtr petWindow, RECT petBounds) {
+            // UI Automation reports physical screen pixels. Temporarily make
+            // this thread per-monitor-aware so the Win32 bubble rectangle and
+            // SetWindowPos use the same coordinate space on a scaled laptop.
+            IntPtr previousContext = SetThreadDpiAwarenessContext(new IntPtr(-4));
+            try {
+                RECT bubbleRect;
+                if (bubble == IntPtr.Zero || petWindow == IntPtr.Zero ||
+                    !GetWindowRect(bubble, out bubbleRect)) return false;
+
+                int bubbleWidth = bubbleRect.Right - bubbleRect.Left;
+                int bubbleHeight = bubbleRect.Bottom - bubbleRect.Top;
+                int petWidth = petBounds.Right - petBounds.Left;
+                int petHeight = petBounds.Bottom - petBounds.Top;
+                if (bubbleWidth <= 0 || bubbleHeight <= 0 || petWidth <= 0 || petHeight <= 0) return false;
+
+                IntPtr monitor = MonitorFromRect(ref petBounds, 2);
+                MONITORINFO info = new MONITORINFO();
+                info.Size = Marshal.SizeOf(typeof(MONITORINFO));
+                if (monitor == IntPtr.Zero || !GetMonitorInfo(monitor, ref info)) return false;
+
+                int dpi = GetWindowDpiValue(petWindow);
+                int gap = Math.Max(4, (int)Math.Round(4.0 * dpi / 96.0));
+                int margin = Math.Max(8, (int)Math.Round(8.0 * dpi / 96.0));
+                int petCenterX = (petBounds.Left + petBounds.Right) / 2;
+                int petCenterY = (petBounds.Top + petBounds.Bottom) / 2;
+                int[,] candidates = new int[,] {
+                    { petBounds.Right + gap, petCenterY - (bubbleHeight / 2) },
+                    { petBounds.Left - gap - bubbleWidth, petCenterY - (bubbleHeight / 2) },
+                    { petCenterX - (bubbleWidth / 2), petBounds.Top - gap - bubbleHeight },
+                    { petCenterX - (bubbleWidth / 2), petBounds.Bottom + gap }
+                };
+
+                int minX = info.Work.Left + margin;
+                int maxX = info.Work.Right - margin - bubbleWidth;
+                int minY = info.Work.Top + margin;
+                int maxY = info.Work.Bottom - margin - bubbleHeight;
+                int left = candidates[0, 0];
+                int top = candidates[0, 1];
+                bool found = false;
+                for (int i = 0; i < candidates.GetLength(0); i++) {
+                    int x = candidates[i, 0];
+                    int y = candidates[i, 1];
+                    if (x >= minX && x <= maxX && y >= minY && y <= maxY) {
+                        left = x;
+                        top = y;
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    left = Math.Max(minX, Math.Min(left, maxX));
+                    top = Math.Max(minY, Math.Min(top, maxY));
+                }
+                return SetWindowPos(bubble, petWindow, left, top, 0, 0, 0x0011);
+            } finally {
+                if (previousContext != IntPtr.Zero) {
+                    SetThreadDpiAwarenessContext(previousContext);
+                }
+            }
+        }
     }
 }
 '@
@@ -575,15 +650,15 @@ $window.ShowActivated = $false
 $window.Focusable = $false
 $window.Topmost = $true
 $window.IsHitTestVisible = $false
-$window.Width = 310
-$window.Height = 90
+$window.Width = 272
+$window.Height = 82
 $window.Opacity = 0
 $window.WindowStartupLocation = [System.Windows.WindowStartupLocation]::Manual
 
 $border = New-Object System.Windows.Controls.Border
-$border.CornerRadius = New-Object System.Windows.CornerRadius(18)
+$border.CornerRadius = New-Object System.Windows.CornerRadius(16)
 $border.BorderThickness = New-Object System.Windows.Thickness(1)
-$border.Padding = New-Object System.Windows.Thickness(16, 10, 16, 10)
+$border.Padding = New-Object System.Windows.Thickness(14, 9, 14, 9)
 $border.Background = ([System.Windows.Media.BrushConverter]::new().ConvertFromString('#FFFEFCF8'))
 $border.BorderBrush = ([System.Windows.Media.BrushConverter]::new().ConvertFromString('#FFE8DCCA'))
 
@@ -592,18 +667,18 @@ $panel.Orientation = [System.Windows.Controls.Orientation]::Horizontal
 
 $ball = New-Object System.Windows.Controls.TextBlock
 $ball.Text = '🏀'
-$ball.FontSize = 18
+$ball.FontSize = 17
 $ball.FontFamily = New-Object System.Windows.Media.FontFamily('Segoe UI Emoji')
 $ball.VerticalAlignment = [System.Windows.VerticalAlignment]::Top
-$ball.Margin = New-Object System.Windows.Thickness(0, 1, 9, 0)
+$ball.Margin = New-Object System.Windows.Thickness(0, 1, 8, 0)
 
 $messageText = New-Object System.Windows.Controls.TextBlock
 $messageText.FontFamily = New-Object System.Windows.Media.FontFamily('Microsoft YaHei UI')
-$messageText.FontSize = 14
+$messageText.FontSize = 13
 $messageText.FontWeight = [System.Windows.FontWeights]::SemiBold
 $messageText.Foreground = ([System.Windows.Media.BrushConverter]::new().ConvertFromString('#FF242B38'))
 $messageText.TextWrapping = [System.Windows.TextWrapping]::Wrap
-$messageText.MaxWidth = 245
+$messageText.MaxWidth = 220
 $messageText.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
 
 $panel.Children.Add($ball) | Out-Null
@@ -613,6 +688,120 @@ $window.Content = $border
 $script:bubbleHandle = [IntPtr]::Zero
 $script:bubbleSource = $null
 $script:pointerMessageHook = $null
+$script:petVisualBounds = $null
+$script:lastBubbleMetricKey = ''
+
+function Set-ResponsiveBubbleMetrics {
+    param(
+        [IntPtr]$BubbleHandle,
+        [IntPtr]$PetWindow = [IntPtr]::Zero,
+        $PetBounds = $null
+    )
+
+    $dpiWindow = if ($PetWindow -ne [IntPtr]::Zero) { $PetWindow } else { $BubbleHandle }
+    $dpi = [PaperCheer.NativeWindow]::GetWindowDpiValue($dpiWindow)
+    $dpiScale = [Math]::Max(1.0, $dpi / 96.0)
+
+    # Scale continuously from the pet's apparent logical width. A 160 px pet
+    # on a 200% laptop is about 80 DIPs and gets the compact end of the range;
+    # the same pet on a 100% desktop gets the roomier end. Moving between
+    # monitors recalculates the ratio on the next position tick.
+    $petLogicalWidth = 80.0
+    if ($null -ne $PetBounds -and ($PetBounds.Right - $PetBounds.Left) -gt 0) {
+        $petLogicalWidth = ($PetBounds.Right - $PetBounds.Left) / $dpiScale
+    }
+    $sizeRatio = [Math]::Max(0.0, [Math]::Min(1.0, ($petLogicalWidth - 80.0) / 90.0))
+    $metricKey = '{0}:{1}' -f $dpi, [Math]::Round($petLogicalWidth)
+    if ($script:lastBubbleMetricKey -eq $metricKey) {
+        return
+    }
+    $script:lastBubbleMetricKey = $metricKey
+
+    $bubbleWidth = [Math]::Round(204.0 + (68.0 * $sizeRatio))
+    $bubbleHeight = [Math]::Round(66.0 + (16.0 * $sizeRatio))
+    $paddingX = 10.0 + (4.0 * $sizeRatio)
+    $paddingY = 7.0 + (2.0 * $sizeRatio)
+    $cornerRadius = 14.0 + (2.0 * $sizeRatio)
+    $iconSize = 14.0 + (3.0 * $sizeRatio)
+    $iconGap = 6.0 + (2.0 * $sizeRatio)
+    $textSize = 11.5 + (1.5 * $sizeRatio)
+
+    $window.Width = $bubbleWidth
+    $window.Height = $bubbleHeight
+    $border.CornerRadius = New-Object System.Windows.CornerRadius($cornerRadius)
+    $border.Padding = New-Object System.Windows.Thickness($paddingX, $paddingY, $paddingX, $paddingY)
+    $ball.FontSize = $iconSize
+    $ball.Margin = New-Object System.Windows.Thickness(0, 1, $iconGap, 0)
+    $messageText.FontSize = $textSize
+    $messageText.MaxWidth = [Math]::Max(150, $bubbleWidth - 48)
+    $window.UpdateLayout()
+}
+
+function Get-PetVisualBounds {
+    param([IntPtr]$PetWindow)
+
+    if ($PetWindow -eq [IntPtr]::Zero) {
+        return $null
+    }
+    try {
+        $root = [System.Windows.Automation.AutomationElement]::FromHandle($PetWindow)
+        if ($null -eq $root) {
+            return $null
+        }
+        $imageCondition = New-Object System.Windows.Automation.PropertyCondition(
+            [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+            [System.Windows.Automation.ControlType]::Image
+        )
+        $images = $root.FindAll(
+            [System.Windows.Automation.TreeScope]::Descendants,
+            $imageCondition
+        )
+        $preferred = @()
+        $fallback = @()
+        for ($index = 0; $index -lt $images.Count; $index++) {
+            try {
+                $current = $images.Item($index).Current
+                if ($current.IsOffscreen) {
+                    continue
+                }
+                $bounds = $current.BoundingRectangle
+                if ([double]::IsNaN($bounds.Left) -or [double]::IsInfinity($bounds.Left) -or
+                    [double]::IsNaN($bounds.Top) -or [double]::IsInfinity($bounds.Top) -or
+                    $bounds.Width -lt 40 -or $bounds.Height -lt 40) {
+                    continue
+                }
+                $candidate = [pscustomobject]@{
+                    left = [int][Math]::Floor($bounds.Left)
+                    top = [int][Math]::Floor($bounds.Top)
+                    right = [int][Math]::Ceiling($bounds.Right)
+                    bottom = [int][Math]::Ceiling($bounds.Bottom)
+                    width = [int][Math]::Ceiling($bounds.Width)
+                    height = [int][Math]::Ceiling($bounds.Height)
+                    className = [string]$current.ClassName
+                }
+                $fallback += $candidate
+                if ($candidate.className.IndexOf('codex-avatar-button', [StringComparison]::OrdinalIgnoreCase) -ge 0) {
+                    $preferred += $candidate
+                }
+            } catch {
+                # Chromium accessibility nodes can change during animation.
+            }
+        }
+        $candidates = if ($preferred.Count -gt 0) { @($preferred) } else { @($fallback) }
+        $mascot = @($candidates | Sort-Object { $_.width * $_.height } -Descending | Select-Object -First 1)
+        if ($mascot.Count -eq 0) {
+            return $null
+        }
+        $rect = New-Object PaperCheer.NativeWindow+RECT
+        $rect.Left = $mascot[0].left
+        $rect.Top = $mascot[0].top
+        $rect.Right = $mascot[0].right
+        $rect.Bottom = $mascot[0].bottom
+        return $rect
+    } catch {
+        return $null
+    }
+}
 
 function Update-BubblePosition {
     $virtualLeft = [System.Windows.SystemParameters]::VirtualScreenLeft
@@ -623,6 +812,22 @@ function Update-BubblePosition {
     $target = New-Object PaperCheer.NativeWindow+RECT
     $petWindow = [IntPtr]::Zero
     if ([PaperCheer.NativeWindow]::TryGetCodexPetWindow([ref]$petWindow, [ref]$target)) {
+        if ($null -eq $script:petVisualBounds) {
+            $script:petVisualBounds = Get-PetVisualBounds -PetWindow $petWindow
+        }
+        Set-ResponsiveBubbleMetrics `
+            -BubbleHandle $script:bubbleHandle `
+            -PetWindow $petWindow `
+            -PetBounds $script:petVisualBounds
+        if ($null -ne $script:petVisualBounds -and
+            $script:bubbleHandle -ne [IntPtr]::Zero -and
+            [PaperCheer.NativeWindow]::PositionBubbleNearBounds(
+                $script:bubbleHandle,
+                $petWindow,
+                $script:petVisualBounds
+            )) {
+            return
+        }
         if ($script:bubbleHandle -ne [IntPtr]::Zero -and
             [PaperCheer.NativeWindow]::PositionBubbleNearPet($script:bubbleHandle, $petWindow, $target)) {
             return
@@ -653,8 +858,20 @@ function Update-BubblePosition {
 
 function Get-PetHitBounds {
     $target = New-Object PaperCheer.NativeWindow+RECT
-    if (-not [PaperCheer.NativeWindow]::TryGetCodexPetRect([ref]$target)) {
+    $petWindow = [IntPtr]::Zero
+    if (-not [PaperCheer.NativeWindow]::TryGetCodexPetWindow([ref]$petWindow, [ref]$target)) {
+        $script:petVisualBounds = $null
         return $null
+    }
+
+    $script:petVisualBounds = Get-PetVisualBounds -PetWindow $petWindow
+    if ($null -ne $script:petVisualBounds) {
+        return [pscustomobject]@{
+            Left = $script:petVisualBounds.Left - 6
+            Right = $script:petVisualBounds.Right + 6
+            Top = $script:petVisualBounds.Top - 6
+            Bottom = $script:petVisualBounds.Bottom + 6
+        }
     }
 
     $width = $target.Right - $target.Left
@@ -1043,6 +1260,7 @@ $autoTimer.Add_Tick({
 $window.Add_SourceInitialized({
     $helper = New-Object System.Windows.Interop.WindowInteropHelper($window)
     $script:bubbleHandle = $helper.Handle
+    Set-ResponsiveBubbleMetrics -BubbleHandle $script:bubbleHandle
     [PaperCheer.NativeWindow]::MakeClickThrough($script:bubbleHandle)
     $script:bubbleSource = [System.Windows.Interop.HwndSource]::FromHwnd($script:bubbleHandle)
     $script:pointerMessageHook = [System.Windows.Interop.HwndSourceHook]{

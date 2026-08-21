@@ -1270,6 +1270,9 @@ try {
     $bodyReleaseY = 0
     $bodyForegroundBefore = [IntPtr]::Zero
     $bodyReleaseForegroundBefore = [IntPtr]::Zero
+    $hookReleaseGraceStartedAt = $null
+    $hookReleaseX = 0
+    $hookReleaseY = 0
     $lastFallbackFastClickAt = [DateTime]::MinValue
     $lastHookHealthAt = [DateTime]::MinValue
     $lastAutomationLookup = [DateTime]::MinValue
@@ -1339,6 +1342,7 @@ try {
             $bodyClickArmed = $false
             $bodyDragStarted = $false
             $bodyReleaseCandidateAt = $null
+            $hookReleaseGraceStartedAt = $null
             $script:petAutomationLayout = $null
             $overlay = [IntPtr]::Zero
             Start-Sleep -Milliseconds 100
@@ -1413,6 +1417,7 @@ try {
                     $bodyDownY = $hookY
                     $bodyMaxDistance = 0.0
                     $bodyDragStarted = $false
+                    $hookReleaseGraceStartedAt = $null
                     $bodyForegroundBefore = $hookForegroundBefore
                     if ($bodyForegroundBefore -eq [IntPtr]::Zero) {
                         $bodyForegroundBefore = $foregroundBeforeMouseDown
@@ -1452,6 +1457,7 @@ try {
                             -NativeClickDeflected ([bool]$hookEvent.NativeClickDeflected)
                     }
                     $bodyClickArmed = $false
+                    $hookReleaseGraceStartedAt = $null
                     $dragCaptureActive = $false
                     $dragReleaseCandidateAt = $null
                     if ($bodyDragStarted) {
@@ -1468,16 +1474,42 @@ try {
             }
         }
 
-        if ($mouseHookStarted -and $bodyClickArmed -and -not $leftButtonDown) {
-            # Fail closed if Windows ever drops the queued release record. The
-            # native pet never saw the down, and the helper must stop moving it
-            # as soon as the physical button is no longer held.
-            $bodyClickArmed = $false
-            $bodyDragStarted = $false
-            $dragCaptureActive = $false
-            $dragReleaseCandidateAt = $null
-            $script:petAutomationLayout = $null
-            $lastAutomationLookup = [DateTime]::MinValue
+        if ($mouseHookStarted -and $bodyClickArmed) {
+            if ($leftButtonDown) {
+                $hookReleaseGraceStartedAt = $null
+            } elseif ($null -eq $hookReleaseGraceStartedAt) {
+                # A very fast click can release after DrainMouseHookEvents() but
+                # before GetAsyncKeyState() in this iteration. Give the queued
+                # WM_LBUTTONUP one short turn to arrive instead of disarming the
+                # click before its matching release record can be processed.
+                $hookReleaseGraceStartedAt = [DateTime]::UtcNow
+                $hookReleaseX = $snapshot.cursorX
+                $hookReleaseY = $snapshot.cursorY
+            } elseif (([DateTime]::UtcNow - $hookReleaseGraceStartedAt).TotalMilliseconds -ge 75) {
+                # If Windows really dropped the queued release, complete a
+                # stationary click once. Movement still fails closed as a drag,
+                # so a missing release can neither stick nor become a false click.
+                $releaseDistance = [Math]::Sqrt(
+                    [Math]::Pow($hookReleaseX - $bodyDownX, 2) +
+                    [Math]::Pow($hookReleaseY - $bodyDownY, 2)
+                )
+                $bodyMaxDistance = [Math]::Max($bodyMaxDistance, $releaseDistance)
+                if (-not $bodyDragStarted -and $releaseDistance -lt 8 -and $bodyMaxDistance -lt 8) {
+                    Publish-PetBodyClick `
+                        -At $hookReleaseGraceStartedAt `
+                        -X $hookReleaseX `
+                        -Y $hookReleaseY `
+                        -ForegroundBefore $bodyForegroundBefore `
+                        -ForegroundAtRelease ([ProfessorCluckshotInputNative]::GetForegroundWindow())
+                }
+                $bodyClickArmed = $false
+                $bodyDragStarted = $false
+                $hookReleaseGraceStartedAt = $null
+                $dragCaptureActive = $false
+                $dragReleaseCandidateAt = $null
+                $script:petAutomationLayout = $null
+                $lastAutomationLookup = [DateTime]::MinValue
+            }
         }
 
         if (-not $mouseHookStarted -and $null -ne $bodyReleaseCandidateAt) {
