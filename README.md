@@ -1,8 +1,17 @@
-# Professor Cluckshot
+# 鸡哥 Professor Cluckshot
 
-Professor Cluckshot 是 Codex 桌面端的论文鼓励宠物。它包含完整的 Codex v2 动画、中文随机台词、点击/悬停/拖动反馈，以及 Windows 下的圆形按钮点击修复。
+> 本页默认使用简体中文，安装与排障命令适用于 Windows。
+
+## 中文简介
+
+Professor Cluckshot（鸡哥）是 Codex 桌面端的论文鼓励宠物。它包含完整的 Codex v2 动画、中文随机台词、点击/悬停/拖动反馈，以及 Windows 下的圆形按钮点击修复。
+
+<details>
+<summary>English introduction</summary>
 
 Professor Cluckshot is a basketball-loving research chicken for the Codex desktop app, with a v2 animation atlas, conversational Chinese thesis encouragement, and Windows runtime helpers.
+
+</details>
 
 ## 功能
 
