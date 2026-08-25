@@ -71,6 +71,18 @@ namespace PaperCheer {
             public uint Flags;
         }
 
+        public sealed class BubbleDisplayMetrics {
+            public int WorkWidth { get; private set; }
+            public int WorkHeight { get; private set; }
+            public uint Dpi { get; private set; }
+
+            public BubbleDisplayMetrics(int workWidth, int workHeight, uint dpi) {
+                WorkWidth = workWidth;
+                WorkHeight = workHeight;
+                Dpi = dpi;
+            }
+        }
+
         [DllImport("user32.dll")]
         private static extern bool EnumWindows(EnumWindowsProc callback, IntPtr lParam);
 
@@ -251,6 +263,30 @@ namespace PaperCheer {
                 rightFraction = 0.92;
             }
             return true;
+        }
+
+        public static BubbleDisplayMetrics GetBubbleDisplayMetrics(IntPtr petWindow, RECT target) {
+            int workWidth = 1920;
+            int workHeight = 1080;
+            IntPtr monitor = MonitorFromRect(ref target, 2);
+            MONITORINFO info = new MONITORINFO();
+            info.Size = Marshal.SizeOf(typeof(MONITORINFO));
+            if (monitor != IntPtr.Zero && GetMonitorInfo(monitor, ref info)) {
+                workWidth = Math.Max(1, info.Work.Right - info.Work.Left);
+                workHeight = Math.Max(1, info.Work.Bottom - info.Work.Top);
+            }
+
+            uint dpi = 96;
+            if (petWindow != IntPtr.Zero) {
+                try {
+                    uint detected = GetDpiForWindow(petWindow);
+                    if (detected > 0) dpi = detected;
+                }
+                catch (EntryPointNotFoundException) {
+                    // Older Windows builds do not expose GetDpiForWindow.
+                }
+            }
+            return new BubbleDisplayMetrics(workWidth, workHeight, dpi);
         }
 
         public static bool ActivateCodexMainWindow() {
@@ -650,35 +686,36 @@ $window.ShowActivated = $false
 $window.Focusable = $false
 $window.Topmost = $true
 $window.IsHitTestVisible = $false
-$window.Width = 272
-$window.Height = 82
+$window.Width = 205
+$window.SizeToContent = [System.Windows.SizeToContent]::Height
 $window.Opacity = 0
 $window.WindowStartupLocation = [System.Windows.WindowStartupLocation]::Manual
 
 $border = New-Object System.Windows.Controls.Border
-$border.CornerRadius = New-Object System.Windows.CornerRadius(16)
+$border.CornerRadius = New-Object System.Windows.CornerRadius(13)
 $border.BorderThickness = New-Object System.Windows.Thickness(1)
-$border.Padding = New-Object System.Windows.Thickness(14, 9, 14, 9)
-$border.Background = ([System.Windows.Media.BrushConverter]::new().ConvertFromString('#FFFEFCF8'))
-$border.BorderBrush = ([System.Windows.Media.BrushConverter]::new().ConvertFromString('#FFE8DCCA'))
+$border.Padding = New-Object System.Windows.Thickness(10, 6, 10, 6)
+# Keep glyphs opaque for legibility and make only the rounded panel translucent.
+$border.Background = ([System.Windows.Media.BrushConverter]::new().ConvertFromString('#C8FEFCF8'))
+$border.BorderBrush = ([System.Windows.Media.BrushConverter]::new().ConvertFromString('#88E8DCCA'))
 
 $panel = New-Object System.Windows.Controls.StackPanel
 $panel.Orientation = [System.Windows.Controls.Orientation]::Horizontal
 
 $ball = New-Object System.Windows.Controls.TextBlock
 $ball.Text = '🏀'
-$ball.FontSize = 17
+$ball.FontSize = 16
 $ball.FontFamily = New-Object System.Windows.Media.FontFamily('Segoe UI Emoji')
 $ball.VerticalAlignment = [System.Windows.VerticalAlignment]::Top
-$ball.Margin = New-Object System.Windows.Thickness(0, 1, 8, 0)
+$ball.Margin = New-Object System.Windows.Thickness(0, 1, 7, 0)
 
 $messageText = New-Object System.Windows.Controls.TextBlock
 $messageText.FontFamily = New-Object System.Windows.Media.FontFamily('Microsoft YaHei UI')
-$messageText.FontSize = 13
+$messageText.FontSize = 12
 $messageText.FontWeight = [System.Windows.FontWeights]::SemiBold
 $messageText.Foreground = ([System.Windows.Media.BrushConverter]::new().ConvertFromString('#FF242B38'))
 $messageText.TextWrapping = [System.Windows.TextWrapping]::Wrap
-$messageText.MaxWidth = 220
+$messageText.MaxWidth = 160
 $messageText.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
 
 $panel.Children.Add($ball) | Out-Null
@@ -690,6 +727,7 @@ $script:bubbleSource = $null
 $script:pointerMessageHook = $null
 $script:petVisualBounds = $null
 $script:lastBubbleMetricKey = ''
+$script:bubbleWidthPixels = 205
 
 function Set-ResponsiveBubbleMetrics {
     param(
@@ -699,41 +737,43 @@ function Set-ResponsiveBubbleMetrics {
     )
 
     $dpiWindow = if ($PetWindow -ne [IntPtr]::Zero) { $PetWindow } else { $BubbleHandle }
-    $dpi = [PaperCheer.NativeWindow]::GetWindowDpiValue($dpiWindow)
-    $dpiScale = [Math]::Max(1.0, $dpi / 96.0)
-
-    # Scale continuously from the pet's apparent logical width. A 160 px pet
-    # on a 200% laptop is about 80 DIPs and gets the compact end of the range;
-    # the same pet on a 100% desktop gets the roomier end. Moving between
-    # monitors recalculates the ratio on the next position tick.
-    $petLogicalWidth = 80.0
-    if ($null -ne $PetBounds -and ($PetBounds.Right - $PetBounds.Left) -gt 0) {
-        $petLogicalWidth = ($PetBounds.Right - $PetBounds.Left) / $dpiScale
+    $metricTarget = if ($null -ne $PetBounds) {
+        $PetBounds
+    } else {
+        New-Object PaperCheer.NativeWindow+RECT
     }
-    $sizeRatio = [Math]::Max(0.0, [Math]::Min(1.0, ($petLogicalWidth - 80.0) / 90.0))
-    $metricKey = '{0}:{1}' -f $dpi, [Math]::Round($petLogicalWidth)
+    $metrics = [PaperCheer.NativeWindow]::GetBubbleDisplayMetrics($dpiWindow, $metricTarget)
+    $dpiScale = [Math]::Max(0.75, ([double]$metrics.Dpi / 96.0))
+
+    # Base the WPF size on the work area in device-independent pixels. The
+    # bubble stays compact on small laptops and keeps the same perceived size
+    # on 125%, 150% and 200% displays. Positioning still uses the mascot's UI
+    # Automation bounds, so edge docking remains close to the character.
+    $workWidthDip = [double]$metrics.WorkWidth / $dpiScale
+    $workHeightDip = [double]$metrics.WorkHeight / $dpiScale
+    $compactScale = [Math]::Max(0.84, [Math]::Min(1.0, $workHeightDip / 900.0))
+    $bubbleWidth = [Math]::Round([Math]::Max(168.0, [Math]::Min(205.0, $workWidthDip * 0.105)), 1)
+    $textSize = [Math]::Max(11.0, [Math]::Round((12.0 * $compactScale) * 2.0) / 2.0)
+    $iconSize = [Math]::Max(13.5, [Math]::Round((14.5 * $compactScale) * 2.0) / 2.0)
+    $paddingX = [Math]::Round((9.5 * $compactScale) * 2.0) / 2.0
+    $paddingY = [Math]::Round((5.5 * $compactScale) * 2.0) / 2.0
+    $cornerRadius = [Math]::Round((13.0 * $compactScale) * 2.0) / 2.0
+    $iconGap = 6.0 * $compactScale
+    $textWidth = [Math]::Max(100.0, $bubbleWidth - ($paddingX * 2.0) - $iconSize - 8.0)
+    $metricKey = '{0}:{1}:{2}:{3}' -f $metrics.WorkWidth, $metrics.WorkHeight, $metrics.Dpi, $bubbleWidth
     if ($script:lastBubbleMetricKey -eq $metricKey) {
         return
     }
     $script:lastBubbleMetricKey = $metricKey
 
-    $bubbleWidth = [Math]::Round(204.0 + (68.0 * $sizeRatio))
-    $bubbleHeight = [Math]::Round(66.0 + (16.0 * $sizeRatio))
-    $paddingX = 10.0 + (4.0 * $sizeRatio)
-    $paddingY = 7.0 + (2.0 * $sizeRatio)
-    $cornerRadius = 14.0 + (2.0 * $sizeRatio)
-    $iconSize = 14.0 + (3.0 * $sizeRatio)
-    $iconGap = 6.0 + (2.0 * $sizeRatio)
-    $textSize = 11.5 + (1.5 * $sizeRatio)
-
     $window.Width = $bubbleWidth
-    $window.Height = $bubbleHeight
-    $border.CornerRadius = New-Object System.Windows.CornerRadius($cornerRadius)
-    $border.Padding = New-Object System.Windows.Thickness($paddingX, $paddingY, $paddingX, $paddingY)
+    $border.CornerRadius = [System.Windows.CornerRadius]::new($cornerRadius)
+    $border.Padding = [System.Windows.Thickness]::new($paddingX, $paddingY, $paddingX, $paddingY)
     $ball.FontSize = $iconSize
-    $ball.Margin = New-Object System.Windows.Thickness(0, 1, $iconGap, 0)
+    $ball.Margin = [System.Windows.Thickness]::new(0.0, 1.0, $iconGap, 0.0)
     $messageText.FontSize = $textSize
-    $messageText.MaxWidth = [Math]::Max(150, $bubbleWidth - 48)
+    $messageText.MaxWidth = $textWidth
+    $script:bubbleWidthPixels = [int][Math]::Round($bubbleWidth * $dpiScale)
     $window.UpdateLayout()
 }
 
@@ -835,25 +875,27 @@ function Update-BubblePosition {
 
         # Startup-only fallback before the WPF handle is available.
         $targetHeight = $target.Bottom - $target.Top
+        $bubbleWidth = $script:bubbleWidthPixels
         $rightSideLeft = $target.Right - 150
-        $leftSideLeft = $target.Left - $window.Width + 150
+        $leftSideLeft = $target.Left - $bubbleWidth + 150
         $top = $target.Top + [Math]::Round($targetHeight * 0.66)
 
-        if ($rightSideLeft + $window.Width -le $virtualRight - 8) {
+        if ($rightSideLeft + $bubbleWidth -le $virtualRight - 8) {
             $left = $rightSideLeft
         } elseif ($leftSideLeft -ge $virtualLeft + 8) {
             $left = $leftSideLeft
         } else {
-            $left = $target.Left + [Math]::Round((($target.Right - $target.Left) - $window.Width) / 2)
-            $top = $target.Top - $window.Height - 10
+            $left = $target.Left + [Math]::Round((($target.Right - $target.Left) - $bubbleWidth) / 2)
+            $top = $target.Top - $window.ActualHeight - 10
         }
     } else {
+        Set-ResponsiveBubbleMetrics -BubbleHandle $script:bubbleHandle
         $left = [System.Windows.SystemParameters]::WorkArea.Right - $window.Width - 28
-        $top = [System.Windows.SystemParameters]::WorkArea.Bottom - $window.Height - 240
+        $top = [System.Windows.SystemParameters]::WorkArea.Bottom - $window.ActualHeight - 240
     }
 
     $window.Left = [Math]::Max($virtualLeft + 8, [Math]::Min($left, $virtualRight - $window.Width - 8))
-    $window.Top = [Math]::Max($virtualTop + 8, [Math]::Min($top, $virtualBottom - $window.Height - 8))
+    $window.Top = [Math]::Max($virtualTop + 8, [Math]::Min($top, $virtualBottom - $window.ActualHeight - 8))
 }
 
 function Get-PetHitBounds {

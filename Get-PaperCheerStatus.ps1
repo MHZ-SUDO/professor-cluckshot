@@ -50,6 +50,10 @@ $bridgeScript = Join-Path $petPath 'CodexPetInputBridge.ps1'
 $overlayScript = Join-Path $petPath 'PaperCheerOverlay.ps1'
 $bridge = Get-VerifiedProcess -PidPath (Join-Path $petPath 'codex-pet-input-bridge.pid') -ScriptPath $bridgeScript
 $speech = Get-VerifiedProcess -PidPath (Join-Path $petPath 'paper-cheer-overlay.pid') -ScriptPath $overlayScript
+$powershell = Join-Path $PSHOME 'powershell.exe'
+if (-not (Test-Path -LiteralPath $powershell -PathType Leaf)) {
+    $powershell = (Get-Command powershell.exe -ErrorAction Stop).Source
+}
 
 $manifestValid = $false
 $spriteVersionNumber = $null
@@ -66,7 +70,7 @@ if (Test-Path -LiteralPath $manifestPath -PathType Leaf) {
 $probe = $null
 if (Test-Path -LiteralPath $bridgeScript -PathType Leaf) {
     try {
-        $probeOutput = & (Join-Path $PSHOME 'powershell.exe') -NoProfile -ExecutionPolicy Bypass -File $bridgeScript -ProbeOnly
+        $probeOutput = & $powershell -NoProfile -ExecutionPolicy Bypass -File $bridgeScript -ProbeOnly
         $probe = $probeOutput | ConvertFrom-Json
     } catch {
         $probe = [pscustomobject]@{ overlayFound = $false; error = $_.Exception.Message }
