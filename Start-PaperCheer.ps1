@@ -106,6 +106,28 @@ function Start-Sidecar {
 }
 
 $bridge = Start-Sidecar -ScriptPath $bridgeScript -PidPath $bridgePidPath -ExtraArguments @()
+$pointerEventPath = Join-Path $PSScriptRoot 'paper-cheer-pointer-events.json'
+$bridgeReady = $false
+$bridgeReadyDeadline = (Get-Date).AddSeconds(5)
+do {
+    if (Test-Path -LiteralPath $pointerEventPath -PathType Leaf) {
+        try {
+            $pointerState = Get-Content -LiteralPath $pointerEventPath -Raw -Encoding UTF8 | ConvertFrom-Json
+            $bridgeReady = $null -ne $pointerState -and [int]$pointerState.processId -eq [int]$bridge.processId
+        }
+        catch {
+            $bridgeReady = $false
+        }
+    }
+    if (-not $bridgeReady) {
+        Start-Sleep -Milliseconds 50
+    }
+} while (-not $bridgeReady -and (Get-Date) -lt $bridgeReadyDeadline)
+
+if (-not $bridgeReady) {
+    throw '输入桥未在限时内完成点击事件通道初始化。'
+}
+
 $overlay = Start-Sidecar -ScriptPath $overlayScript -PidPath $overlayPidPath -Sta -ExtraArguments @(
     '-MinIntervalSeconds', [string]$MinIntervalSeconds,
     '-MaxIntervalSeconds', [string]$MaxIntervalSeconds

@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [string]$CodexHome,
 
@@ -108,7 +108,7 @@ if (-not $SkipStart) {
 
 [pscustomobject]@{
     installed = $true
-    version = '1.2.1'
+    version = (Get-Content -LiteralPath (Join-Path $petPath 'package-version.json') -Raw -Encoding UTF8 | ConvertFrom-Json).version
     petPath = $petPath
     startupRegistered = $registerStartup -and (Test-Path -LiteralPath $startupShortcutPath)
     startupShortcut = if ($registerStartup) { $startupShortcutPath } else { $null }

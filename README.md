@@ -16,11 +16,11 @@ Professor Cluckshot is a basketball-loving research chicken for the Codex deskto
 ## 功能
 
 - Codex v2 宠物包：8 × 11、1536 × 2288、RGBA WebP
-- 275 条手写中文台词和超过 52,000 种动态组合
+- 丰富的中文固定台词和超过 52,000 种动态组合
 - 默认每 3–7 分钟随机说话
 - 点击、悬停和拖动反馈
-- 单击鸡哥说话，双击鸡哥才唤起 Codex
-- 拖动期间持续保持鼠标捕获，移出鸡哥热区也不会中断
+- 单击鸡哥触发说话；Codex 原生单击行为也可能唤起主窗口
+- 拖动直接使用 Windows/Codex 原生输入，助手只观察手势
 - 修复语音按钮与收回箭头点击穿透
 - 说话气泡使用原生屏幕坐标贴近宠物，适配缩放和多显示器
 - 气泡始终位于鸡哥后方，不会遮住角色动画
@@ -31,7 +31,13 @@ Professor Cluckshot is a basketball-loving research chicken for the Codex deskto
 
 问题不在 `pet.json` 或精灵图。部分 Windows Codex 版本把宠物放在同时具有 `WS_EX_TRANSPARENT` 和 `WS_EX_LAYERED` 的顶层窗口中。按钮虽然显示在最上层，Windows 却可能把点击交给后面的 Edge、桌面或其他窗口。
 
-本仓库的输入桥会在鼠标进入宠物控制区域时临时关闭这两种命中穿透，离开后恢复原始窗口样式。如果第一次按下仍落到后面的窗口，它只补发一次 Windows 原生单击，不会改动 Codex 安装文件。
+本仓库的输入助手在鼠标进入人物或按钮区域时调整 `WS_EX_TRANSPARENT`，保留 `WS_EX_LAYERED`。拖动期间暂停界面扫描和窗口样式写回，不再拦截或补发鼠标按下、移动、松开消息。它也会避让覆盖宠物的截图选区等窗口，不修改 Codex 安装文件。
+
+## 当前版本：1.2.25
+
+这是用于排除辅助输入转发干扰的原生输入对照版。竖屏副屏识别、气泡显示和点击说话保留；单击不再屏蔽 Codex 默认的唤起主窗口动作。
+
+已通过离屏输入回归和本机运行检查，真实连续拖拽、跨屏手感与截图软件配合仍需人工确认，尚不保证所有 Codex/Windows 组合都已恢复流畅。具体变更见 [CHANGELOG.md](CHANGELOG.md)。
 
 ## 系统要求
 

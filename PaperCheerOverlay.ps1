@@ -13,7 +13,7 @@ param(
     [int]$VisibleSeconds = 13,
 
     [ValidateRange(1, 30)]
-    [int]$RecentHistorySize = 14,
+    [int]$RecentHistorySize = 32,
 
     [switch]$Once
 )
@@ -31,6 +31,8 @@ if ($MaxIntervalSeconds -lt $MinIntervalSeconds) {
 
 Add-Type -AssemblyName PresentationFramework
 Add-Type -AssemblyName WindowsBase
+Add-Type -AssemblyName UIAutomationClient
+Add-Type -AssemblyName UIAutomationTypes
 
 if (-not ('PaperCheer.NativeWindow' -as [type])) {
     Add-Type -TypeDefinition @'
@@ -41,6 +43,11 @@ using System.Text;
 namespace PaperCheer {
     public static class NativeWindow {
         private const int GWL_EXSTYLE = -20;
+        private static readonly System.Threading.EventWaitHandle InputGestureSignal =
+            new System.Threading.EventWaitHandle(false, System.Threading.EventResetMode.ManualReset,
+                @"Local\ProfessorCluckshotInputGesture");
+        public static bool IsInputGestureActive() { return InputGestureSignal.WaitOne(0); }
+
         private const long WS_EX_TRANSPARENT = 0x00000020L;
         private const long WS_EX_TOOLWINDOW = 0x00000080L;
         private const long WS_EX_NOACTIVATE = 0x08000000L;
@@ -69,6 +76,18 @@ namespace PaperCheer {
             public uint Flags;
         }
 
+        public sealed class BubbleDisplayMetrics {
+            public int WorkWidth { get; private set; }
+            public int WorkHeight { get; private set; }
+            public uint Dpi { get; private set; }
+
+            public BubbleDisplayMetrics(int workWidth, int workHeight, uint dpi) {
+                WorkWidth = workWidth;
+                WorkHeight = workHeight;
+                Dpi = dpi;
+            }
+        }
+
         [DllImport("user32.dll")]
         private static extern bool EnumWindows(EnumWindowsProc callback, IntPtr lParam);
 
@@ -92,6 +111,12 @@ namespace PaperCheer {
 
         [DllImport("user32.dll")]
         private static extern bool GetMonitorInfo(IntPtr monitor, ref MONITORINFO info);
+
+        [DllImport("user32.dll")]
+        private static extern uint GetDpiForWindow(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr SetThreadDpiAwarenessContext(IntPtr dpiContext);
 
         [DllImport("user32.dll")]
         private static extern bool SetWindowPos(
@@ -128,7 +153,7 @@ namespace PaperCheer {
         [DllImport("user32.dll")]
         public static extern uint GetDoubleClickTime();
 
-        [DllImport("user32.dll")]
+        [DllImport("user32.dll", EntryPoint = "GetPhysicalCursorPos")]
         public static extern bool GetCursorPos(out POINT point);
 
         [DllImport("user32.dll")]
@@ -168,11 +193,8 @@ namespace PaperCheer {
 
         public static bool TryGetCodexPetWindow(out IntPtr resultWindow, out RECT result) {
             IntPtr bestPreferredWindow = IntPtr.Zero;
-            IntPtr bestFallbackWindow = IntPtr.Zero;
             RECT bestPreferredRect = new RECT();
-            RECT bestFallbackRect = new RECT();
             int bestPreferredScore = Int32.MaxValue;
-            int bestFallbackScore = Int32.MaxValue;
 
             EnumWindows(delegate(IntPtr hWnd, IntPtr lParam) {
                 if (!IsWindowVisible(hWnd)) return true;
@@ -181,7 +203,10 @@ namespace PaperCheer {
                 StringBuilder className = new StringBuilder(128);
                 GetWindowText(hWnd, title, title.Capacity);
                 GetClassName(hWnd, className, className.Capacity);
-                if (!String.Equals(title.ToString(), "Codex", StringComparison.Ordinal)) return true;
+                string windowTitle = title.ToString();
+                bool supportedTitle = String.Equals(windowTitle, "Codex", StringComparison.Ordinal) ||
+                    String.Equals(windowTitle, "ChatGPT", StringComparison.Ordinal);
+                if (!supportedTitle) return true;
                 string windowClass = className.ToString();
                 if (windowClass != "Chrome_WidgetWin_1" && windowClass != "FLUTTERVIEW") return true;
 
@@ -190,7 +215,7 @@ namespace PaperCheer {
 
                 int width = rect.Right - rect.Left;
                 int height = rect.Bottom - rect.Top;
-                if (width < 120 || width > 1200 || height < 120 || height > 1200) return true;
+                if (width < 40 || height < 40) return true;
 
                 long style = GetWindowLongPtr(hWnd, GWL_EXSTYLE).ToInt64();
                 bool preferred = (style & 0x8L) != 0 && (style & WS_EX_TOOLWINDOW) != 0;
@@ -200,11 +225,6 @@ namespace PaperCheer {
                     bestPreferredWindow = hWnd;
                     bestPreferredRect = rect;
                 }
-                if (score < bestFallbackScore) {
-                    bestFallbackScore = score;
-                    bestFallbackWindow = hWnd;
-                    bestFallbackRect = rect;
-                }
                 return true;
             }, IntPtr.Zero);
 
@@ -213,9 +233,10 @@ namespace PaperCheer {
                 result = bestPreferredRect;
                 return true;
             }
-            resultWindow = bestFallbackWindow;
-            result = bestFallbackRect;
-            return bestFallbackScore != Int32.MaxValue;
+            // A normal small Codex window is not a pet when its overlay is hidden.
+            resultWindow = IntPtr.Zero;
+            result = new RECT();
+            return false;
         }
 
         public static bool TryGetCodexPetRect(out RECT result) {
@@ -243,6 +264,30 @@ namespace PaperCheer {
                 rightFraction = 0.92;
             }
             return true;
+        }
+
+        public static BubbleDisplayMetrics GetBubbleDisplayMetrics(IntPtr petWindow, RECT target) {
+            int workWidth = 1920;
+            int workHeight = 1080;
+            IntPtr monitor = MonitorFromRect(ref target, 2);
+            MONITORINFO info = new MONITORINFO();
+            info.Size = Marshal.SizeOf(typeof(MONITORINFO));
+            if (monitor != IntPtr.Zero && GetMonitorInfo(monitor, ref info)) {
+                workWidth = Math.Max(1, info.Work.Right - info.Work.Left);
+                workHeight = Math.Max(1, info.Work.Bottom - info.Work.Top);
+            }
+
+            uint dpi = 96;
+            if (petWindow != IntPtr.Zero) {
+                try {
+                    uint detected = GetDpiForWindow(petWindow);
+                    if (detected > 0) dpi = detected;
+                }
+                catch (EntryPointNotFoundException) {
+                    // Older Windows builds do not expose GetDpiForWindow.
+                }
+            }
+            return new BubbleDisplayMetrics(workWidth, workHeight, dpi);
         }
 
         public static bool ActivateCodexMainWindow() {
@@ -278,10 +323,10 @@ namespace PaperCheer {
             }, IntPtr.Zero);
 
             if (best == IntPtr.Zero) return false;
-            return RestoreForegroundWindow(best);
+            return ActivateWindow(best);
         }
 
-        public static bool RestoreForegroundWindow(IntPtr window) {
+        private static bool ActivateWindow(IntPtr window) {
             if (window == IntPtr.Zero) return false;
             uint processId;
             IntPtr foreground = GetForegroundWindow();
@@ -363,6 +408,73 @@ namespace PaperCheer {
             // so wide text or an animated pose can never cover the character.
             return SetWindowPos(bubble, petWindow, left, top, 0, 0, 0x0011);
         }
+
+        public static int GetWindowDpiValue(IntPtr window) {
+            uint dpi = window == IntPtr.Zero ? 0 : GetDpiForWindow(window);
+            return dpi == 0 ? 96 : (int)dpi;
+        }
+
+        public static bool PositionBubbleNearBounds(IntPtr bubble, IntPtr petWindow, RECT petBounds) {
+            // UI Automation reports physical screen pixels. Temporarily make
+            // this thread per-monitor-aware so the Win32 bubble rectangle and
+            // SetWindowPos use the same coordinate space on a scaled laptop.
+            IntPtr previousContext = SetThreadDpiAwarenessContext(new IntPtr(-4));
+            try {
+                RECT bubbleRect;
+                if (bubble == IntPtr.Zero || petWindow == IntPtr.Zero ||
+                    !GetWindowRect(bubble, out bubbleRect)) return false;
+
+                int bubbleWidth = bubbleRect.Right - bubbleRect.Left;
+                int bubbleHeight = bubbleRect.Bottom - bubbleRect.Top;
+                int petWidth = petBounds.Right - petBounds.Left;
+                int petHeight = petBounds.Bottom - petBounds.Top;
+                if (bubbleWidth <= 0 || bubbleHeight <= 0 || petWidth <= 0 || petHeight <= 0) return false;
+
+                IntPtr monitor = MonitorFromRect(ref petBounds, 2);
+                MONITORINFO info = new MONITORINFO();
+                info.Size = Marshal.SizeOf(typeof(MONITORINFO));
+                if (monitor == IntPtr.Zero || !GetMonitorInfo(monitor, ref info)) return false;
+
+                int dpi = GetWindowDpiValue(petWindow);
+                int gap = Math.Max(4, (int)Math.Round(4.0 * dpi / 96.0));
+                int margin = Math.Max(8, (int)Math.Round(8.0 * dpi / 96.0));
+                int petCenterX = (petBounds.Left + petBounds.Right) / 2;
+                int petCenterY = (petBounds.Top + petBounds.Bottom) / 2;
+                int[,] candidates = new int[,] {
+                    { petBounds.Right + gap, petCenterY - (bubbleHeight / 2) },
+                    { petBounds.Left - gap - bubbleWidth, petCenterY - (bubbleHeight / 2) },
+                    { petCenterX - (bubbleWidth / 2), petBounds.Top - gap - bubbleHeight },
+                    { petCenterX - (bubbleWidth / 2), petBounds.Bottom + gap }
+                };
+
+                int minX = info.Work.Left + margin;
+                int maxX = info.Work.Right - margin - bubbleWidth;
+                int minY = info.Work.Top + margin;
+                int maxY = info.Work.Bottom - margin - bubbleHeight;
+                int left = candidates[0, 0];
+                int top = candidates[0, 1];
+                bool found = false;
+                for (int i = 0; i < candidates.GetLength(0); i++) {
+                    int x = candidates[i, 0];
+                    int y = candidates[i, 1];
+                    if (x >= minX && x <= maxX && y >= minY && y <= maxY) {
+                        left = x;
+                        top = y;
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    left = Math.Max(minX, Math.Min(left, maxX));
+                    top = Math.Max(minY, Math.Min(top, maxY));
+                }
+                return SetWindowPos(bubble, petWindow, left, top, 0, 0, 0x0011);
+            } finally {
+                if (previousContext != IntPtr.Zero) {
+                    SetThreadDpiAwarenessContext(previousContext);
+                }
+            }
+        }
     }
 }
 '@
@@ -373,6 +485,13 @@ $dialoguePath = Join-Path $packageRoot 'paper-cheer-dialogue.json'
 $statePath = Join-Path $packageRoot 'paper-cheer-overlay-state.json'
 $lastMessagePath = Join-Path $packageRoot 'paper-cheer-last-message.json'
 $commandPath = Join-Path $packageRoot 'paper-cheer-command.json'
+$pointerEventPath = Join-Path $packageRoot 'paper-cheer-pointer-events.json'
+$inputBridgeScript = Join-Path $packageRoot 'CodexPetInputBridge.ps1'
+$inputBridgePidPath = Join-Path $packageRoot 'codex-pet-input-bridge.pid'
+$powershellExecutable = Join-Path $PSHOME 'powershell.exe'
+if (-not (Test-Path -LiteralPath $powershellExecutable -PathType Leaf)) {
+    $powershellExecutable = (Get-Command powershell.exe -ErrorAction Stop).Source
+}
 
 if (-not (Test-Path -LiteralPath $dialoguePath)) {
     throw "找不到台词库：$dialoguePath"
@@ -558,6 +677,7 @@ function Take-ManualCommand {
 }
 
 $window = New-Object System.Windows.Window
+$window.Title = 'Professor Cluckshot Speech Overlay'
 $window.WindowStyle = [System.Windows.WindowStyle]::None
 $window.ResizeMode = [System.Windows.ResizeMode]::NoResize
 $window.AllowsTransparency = $true
@@ -567,42 +687,195 @@ $window.ShowActivated = $false
 $window.Focusable = $false
 $window.Topmost = $true
 $window.IsHitTestVisible = $false
-$window.Width = 310
-$window.Height = 90
+$window.UseLayoutRounding = $true
+$window.Width = 240
+$window.SizeToContent = [System.Windows.SizeToContent]::Height
 $window.Opacity = 0
 $window.WindowStartupLocation = [System.Windows.WindowStartupLocation]::Manual
 
 $border = New-Object System.Windows.Controls.Border
-$border.CornerRadius = New-Object System.Windows.CornerRadius(18)
+$border.CornerRadius = New-Object System.Windows.CornerRadius(15)
 $border.BorderThickness = New-Object System.Windows.Thickness(1)
-$border.Padding = New-Object System.Windows.Thickness(16, 10, 16, 10)
-$border.Background = ([System.Windows.Media.BrushConverter]::new().ConvertFromString('#FFFEFCF8'))
-$border.BorderBrush = ([System.Windows.Media.BrushConverter]::new().ConvertFromString('#FFE8DCCA'))
+$border.Padding = New-Object System.Windows.Thickness(12, 7, 12, 7)
+$border.SnapsToDevicePixels = $true
+# Keep glyphs opaque for legibility and make only the rounded panel translucent.
+$border.Background = ([System.Windows.Media.BrushConverter]::new().ConvertFromString('#C8FEFCF8'))
+$border.BorderBrush = ([System.Windows.Media.BrushConverter]::new().ConvertFromString('#88E8DCCA'))
 
-$panel = New-Object System.Windows.Controls.StackPanel
-$panel.Orientation = [System.Windows.Controls.Orientation]::Horizontal
+$panel = New-Object System.Windows.Controls.Grid
+$iconColumn = New-Object System.Windows.Controls.ColumnDefinition
+$iconColumn.Width = [System.Windows.GridLength]::Auto
+$textColumn = New-Object System.Windows.Controls.ColumnDefinition
+$textColumn.Width = [System.Windows.GridLength]::new(1.0, [System.Windows.GridUnitType]::Star)
+$panel.ColumnDefinitions.Add($iconColumn) | Out-Null
+$panel.ColumnDefinitions.Add($textColumn) | Out-Null
 
 $ball = New-Object System.Windows.Controls.TextBlock
 $ball.Text = '🏀'
-$ball.FontSize = 18
+$ball.FontSize = 16
 $ball.FontFamily = New-Object System.Windows.Media.FontFamily('Segoe UI Emoji')
 $ball.VerticalAlignment = [System.Windows.VerticalAlignment]::Top
-$ball.Margin = New-Object System.Windows.Thickness(0, 1, 9, 0)
+$ball.Margin = New-Object System.Windows.Thickness(0, 1, 7, 0)
 
 $messageText = New-Object System.Windows.Controls.TextBlock
 $messageText.FontFamily = New-Object System.Windows.Media.FontFamily('Microsoft YaHei UI')
-$messageText.FontSize = 14
+$messageText.FontSize = 13
 $messageText.FontWeight = [System.Windows.FontWeights]::SemiBold
 $messageText.Foreground = ([System.Windows.Media.BrushConverter]::new().ConvertFromString('#FF242B38'))
 $messageText.TextWrapping = [System.Windows.TextWrapping]::Wrap
-$messageText.MaxWidth = 245
+$messageText.TextTrimming = [System.Windows.TextTrimming]::None
+$messageText.MaxWidth = [double]::PositiveInfinity
+$messageText.HorizontalAlignment = [System.Windows.HorizontalAlignment]::Stretch
 $messageText.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
 
+[System.Windows.Controls.Grid]::SetColumn($ball, 0)
+[System.Windows.Controls.Grid]::SetColumn($messageText, 1)
 $panel.Children.Add($ball) | Out-Null
 $panel.Children.Add($messageText) | Out-Null
 $border.Child = $panel
 $window.Content = $border
 $script:bubbleHandle = [IntPtr]::Zero
+$script:bubbleSource = $null
+$script:pointerMessageHook = $null
+$script:petVisualBounds = $null
+$script:lastBubbleMetricKey = ''
+$script:bubbleWidthPixels = 240
+
+function Set-ResponsiveBubbleMetrics {
+    param(
+        [IntPtr]$BubbleHandle,
+        [IntPtr]$PetWindow = [IntPtr]::Zero,
+        $PetBounds = $null
+    )
+
+    $dpiWindow = if ($PetWindow -ne [IntPtr]::Zero) { $PetWindow } else { $BubbleHandle }
+    $metricTarget = if ($null -ne $PetBounds) {
+        $PetBounds
+    } else {
+        New-Object PaperCheer.NativeWindow+RECT
+    }
+    $metrics = [PaperCheer.NativeWindow]::GetBubbleDisplayMetrics($dpiWindow, $metricTarget)
+    $dpiScale = [Math]::Max(0.75, ([double]$metrics.Dpi / 96.0))
+
+    # Base the WPF size on the work area in device-independent pixels. The
+    # bubble stays compact on small laptops and keeps the same perceived size
+    # on 125%, 150% and 200% displays. Positioning still uses the mascot's UI
+    # Automation bounds, so edge docking remains close to the character.
+    $workWidthDip = [double]$metrics.WorkWidth / $dpiScale
+    $workHeightDip = [double]$metrics.WorkHeight / $dpiScale
+    $compactScale = [Math]::Max(0.84, [Math]::Min(1.0, $workHeightDip / 900.0))
+    $bubbleWidth = [Math]::Round([Math]::Max(200.0, [Math]::Min(240.0, $workWidthDip * 0.12)), 1)
+    $textSize = [Math]::Max(11.5, [Math]::Round((12.8 * $compactScale) * 2.0) / 2.0)
+    $iconSize = [Math]::Max(14.5, [Math]::Round((15.5 * $compactScale) * 2.0) / 2.0)
+    $paddingX = [Math]::Round((11.5 * $compactScale) * 2.0) / 2.0
+    $paddingY = [Math]::Round((6.5 * $compactScale) * 2.0) / 2.0
+    $cornerRadius = [Math]::Round((14.5 * $compactScale) * 2.0) / 2.0
+    $iconGap = 7.0 * $compactScale
+    $metricKey = '{0}:{1}:{2}:{3}' -f $metrics.WorkWidth, $metrics.WorkHeight, $metrics.Dpi, $bubbleWidth
+    if ($script:lastBubbleMetricKey -eq $metricKey) {
+        return
+    }
+    $script:lastBubbleMetricKey = $metricKey
+
+    $window.Width = $bubbleWidth
+    $border.CornerRadius = [System.Windows.CornerRadius]::new($cornerRadius)
+    $border.Padding = [System.Windows.Thickness]::new($paddingX, $paddingY, $paddingX, $paddingY)
+    $ball.FontSize = $iconSize
+    $ball.Margin = [System.Windows.Thickness]::new(0.0, 1.0, $iconGap, 0.0)
+    $messageText.FontSize = $textSize
+    $messageText.MaxWidth = [double]::PositiveInfinity
+    $script:bubbleWidthPixels = [int][Math]::Round($bubbleWidth * $dpiScale)
+    $window.UpdateLayout()
+}
+
+function Update-BubbleContentMeasure {
+    # Text changes can add or remove wrapped lines without changing the monitor
+    # metric key. Explicitly invalidate the complete content tree so WPF updates
+    # SizeToContent before native positioning reads the window rectangle.
+    $messageText.InvalidateMeasure()
+    $panel.InvalidateMeasure()
+    $border.InvalidateMeasure()
+    $window.InvalidateMeasure()
+    $window.UpdateLayout()
+}
+
+function Get-PetVisualBounds {
+    param([IntPtr]$PetWindow)
+
+    if ($PetWindow -eq [IntPtr]::Zero) {
+        return $null
+    }
+    try {
+        $root = [System.Windows.Automation.AutomationElement]::FromHandle($PetWindow)
+        if ($null -eq $root) {
+            return $null
+        }
+        $imageCondition = New-Object System.Windows.Automation.PropertyCondition(
+            [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+            [System.Windows.Automation.ControlType]::Image
+        )
+        $images = $root.FindAll(
+            [System.Windows.Automation.TreeScope]::Descendants,
+            $imageCondition
+        )
+        $preferred = @()
+        $fallback = @()
+        for ($index = 0; $index -lt $images.Count; $index++) {
+            try {
+                $current = $images.Item($index).Current
+                if ($current.IsOffscreen) {
+                    continue
+                }
+                $bounds = $current.BoundingRectangle
+                if ([double]::IsNaN($bounds.Left) -or [double]::IsInfinity($bounds.Left) -or
+                    [double]::IsNaN($bounds.Top) -or [double]::IsInfinity($bounds.Top) -or
+                    $bounds.Width -lt 40 -or $bounds.Height -lt 40) {
+                    continue
+                }
+                $candidate = [pscustomobject]@{
+                    left = [int][Math]::Floor($bounds.Left)
+                    top = [int][Math]::Floor($bounds.Top)
+                    right = [int][Math]::Ceiling($bounds.Right)
+                    bottom = [int][Math]::Ceiling($bounds.Bottom)
+                    width = [int][Math]::Ceiling($bounds.Width)
+                    height = [int][Math]::Ceiling($bounds.Height)
+                    className = [string]$current.ClassName
+                }
+                $fallback += $candidate
+                if ($candidate.className.IndexOf('codex-avatar-button', [StringComparison]::OrdinalIgnoreCase) -ge 0) {
+                    $preferred += $candidate
+                }
+            } catch {
+                # Chromium accessibility nodes can change during animation.
+            }
+        }
+        $candidates = if ($preferred.Count -gt 0) { @($preferred) } else { @($fallback) }
+        $mascot = @($candidates | Sort-Object { $_.width * $_.height } -Descending | Select-Object -First 1)
+        if ($mascot.Count -eq 0) {
+            return $null
+        }
+        $rect = New-Object PaperCheer.NativeWindow+RECT
+        $rect.Left = $mascot[0].left
+        $rect.Top = $mascot[0].top
+        $rect.Right = $mascot[0].right
+        $rect.Bottom = $mascot[0].bottom
+        return $rect
+    } catch {
+        return $null
+    }
+}
+
+function Hide-MissingPetBubble {
+    $hideTimer.Stop()
+    $window.BeginAnimation([System.Windows.UIElement]::OpacityProperty, $null)
+    $window.Opacity = 0
+    if ($window.IsVisible) { $window.Hide() }
+    $script:petVisualBounds = $null
+    $script:petHitBounds = $null
+    $script:pendingPetClickAt = $null
+    $script:petHoverStartedAt = $null
+    $script:mouseDownOnPet = $false
+}
 
 function Update-BubblePosition {
     $virtualLeft = [System.Windows.SystemParameters]::VirtualScreenLeft
@@ -613,6 +886,22 @@ function Update-BubblePosition {
     $target = New-Object PaperCheer.NativeWindow+RECT
     $petWindow = [IntPtr]::Zero
     if ([PaperCheer.NativeWindow]::TryGetCodexPetWindow([ref]$petWindow, [ref]$target)) {
+        if ($null -eq $script:petVisualBounds) {
+            $script:petVisualBounds = Get-PetVisualBounds -PetWindow $petWindow
+        }
+        Set-ResponsiveBubbleMetrics `
+            -BubbleHandle $script:bubbleHandle `
+            -PetWindow $petWindow `
+            -PetBounds $script:petVisualBounds
+        if ($null -ne $script:petVisualBounds -and
+            $script:bubbleHandle -ne [IntPtr]::Zero -and
+            [PaperCheer.NativeWindow]::PositionBubbleNearBounds(
+                $script:bubbleHandle,
+                $petWindow,
+                $script:petVisualBounds
+            )) {
+            return
+        }
         if ($script:bubbleHandle -ne [IntPtr]::Zero -and
             [PaperCheer.NativeWindow]::PositionBubbleNearPet($script:bubbleHandle, $petWindow, $target)) {
             return
@@ -620,31 +909,44 @@ function Update-BubblePosition {
 
         # Startup-only fallback before the WPF handle is available.
         $targetHeight = $target.Bottom - $target.Top
+        $bubbleWidth = $script:bubbleWidthPixels
         $rightSideLeft = $target.Right - 150
-        $leftSideLeft = $target.Left - $window.Width + 150
+        $leftSideLeft = $target.Left - $bubbleWidth + 150
         $top = $target.Top + [Math]::Round($targetHeight * 0.66)
 
-        if ($rightSideLeft + $window.Width -le $virtualRight - 8) {
+        if ($rightSideLeft + $bubbleWidth -le $virtualRight - 8) {
             $left = $rightSideLeft
         } elseif ($leftSideLeft -ge $virtualLeft + 8) {
             $left = $leftSideLeft
         } else {
-            $left = $target.Left + [Math]::Round((($target.Right - $target.Left) - $window.Width) / 2)
-            $top = $target.Top - $window.Height - 10
+            $left = $target.Left + [Math]::Round((($target.Right - $target.Left) - $bubbleWidth) / 2)
+            $top = $target.Top - $window.ActualHeight - 10
         }
     } else {
-        $left = [System.Windows.SystemParameters]::WorkArea.Right - $window.Width - 28
-        $top = [System.Windows.SystemParameters]::WorkArea.Bottom - $window.Height - 240
+        Hide-MissingPetBubble
+        return
     }
 
     $window.Left = [Math]::Max($virtualLeft + 8, [Math]::Min($left, $virtualRight - $window.Width - 8))
-    $window.Top = [Math]::Max($virtualTop + 8, [Math]::Min($top, $virtualBottom - $window.Height - 8))
+    $window.Top = [Math]::Max($virtualTop + 8, [Math]::Min($top, $virtualBottom - $window.ActualHeight - 8))
 }
 
 function Get-PetHitBounds {
     $target = New-Object PaperCheer.NativeWindow+RECT
-    if (-not [PaperCheer.NativeWindow]::TryGetCodexPetRect([ref]$target)) {
+    $petWindow = [IntPtr]::Zero
+    if (-not [PaperCheer.NativeWindow]::TryGetCodexPetWindow([ref]$petWindow, [ref]$target)) {
+        $script:petVisualBounds = $null
         return $null
+    }
+
+    $script:petVisualBounds = Get-PetVisualBounds -PetWindow $petWindow
+    if ($null -ne $script:petVisualBounds) {
+        return [pscustomobject]@{
+            Left = $script:petVisualBounds.Left - 6
+            Right = $script:petVisualBounds.Right + 6
+            Top = $script:petVisualBounds.Top - 6
+            Bottom = $script:petVisualBounds.Bottom + 6
+        }
     }
 
     $width = $target.Right - $target.Left
@@ -657,9 +959,9 @@ function Get-PetHitBounds {
         [ref]$petRightFraction
     )
     return [pscustomobject]@{
-        Left = $target.Left + [Math]::Round($width * [Math]::Max(0.0, $petLeftFraction - 0.02))
-        Right = $target.Left + [Math]::Round($width * [Math]::Min(1.0, $petRightFraction + 0.04))
-        Top = $target.Top + [Math]::Round($height * 0.62)
+        Left = $target.Left + [Math]::Round($width * [Math]::Max(0.0, $petLeftFraction - 0.06))
+        Right = $target.Left + [Math]::Round($width * [Math]::Min(1.0, $petRightFraction + 0.06))
+        Top = $target.Top + [Math]::Round($height * 0.45)
         Bottom = $target.Top + [Math]::Round($height * 0.90)
     }
 }
@@ -680,14 +982,20 @@ function Write-PetInteractionState {
     param([string]$Action, [datetime]$At)
 
     $script:interactionRegisterCount++
-    $event = [pscustomobject]@{ action = $Action; at = $At.ToString('o') }
+    $event = [pscustomobject]@{
+        action = $Action
+        at = $At.ToString('o')
+        recordedAt = (Get-Date).ToString('o')
+    }
     $script:interactionHistory = @($script:interactionHistory + $event | Select-Object -Last 12)
     $payload = [ordered]@{
         action = $Action
         at = $At.ToString('o')
         registerCount = $script:interactionRegisterCount
         foregroundBeforeClick = $script:foregroundBeforePetClick.ToInt64()
-        restoreWindow = $script:pendingForegroundRestore.ToInt64()
+        restoreWindow = 0
+        focusPolicy = 'single-click-no-window-mutation'
+        doubleClickMilliseconds = $script:doubleClickMilliseconds
         history = $script:interactionHistory
     }
     [System.IO.File]::WriteAllText(
@@ -701,20 +1009,12 @@ function Register-PetClick {
     param(
         [datetime]$At,
         [int]$X,
-        [int]$Y
+        [int]$Y,
+        [IntPtr]$ForegroundBefore = [IntPtr]::Zero
     )
 
     if ($At -lt $script:ignorePetClicksUntil) {
         return
-    }
-
-    if ($null -eq $script:pendingPetClickAt) {
-        # A new interaction supersedes the tail of the previous single-click
-        # foreground restoration. Otherwise that old timer can steal focus
-        # back immediately after a later double-click opens Codex.
-        $script:pendingForegroundRestore = [IntPtr]::Zero
-        $script:pendingForegroundRestoreAt = $null
-        $script:pendingForegroundRestoreStopAt = $null
     }
 
     if ($null -ne $script:pendingPetClickAt) {
@@ -725,9 +1025,6 @@ function Register-PetClick {
         )
         if ($elapsed -le $script:doubleClickMilliseconds -and $distance -lt 16) {
             $script:pendingPetClickAt = $null
-            $script:pendingForegroundRestore = [IntPtr]::Zero
-            $script:pendingForegroundRestoreAt = $null
-            $script:pendingForegroundRestoreStopAt = $null
             # The native pet may emit one delayed relay more than two seconds
             # after a completed double-click. Ignore that tail event so it
             # cannot turn the successful double-click back into a single.
@@ -742,15 +1039,68 @@ function Register-PetClick {
     $script:pendingPetClickAt = $At
     $script:pendingPetClickX = $X
     $script:pendingPetClickY = $Y
-    if ($script:foregroundBeforePetClick -ne [IntPtr]::Zero) {
-        $script:pendingForegroundRestore = $script:foregroundBeforePetClick
-        # Do not switch windows during the native double-click interval: a
-        # foreground switch can swallow the second physical click. A true
-        # single click is restored immediately after this interval expires.
-        $script:pendingForegroundRestoreAt = $At.AddMilliseconds($script:systemDoubleClickMilliseconds + 25)
-        $script:pendingForegroundRestoreStopAt = $null
+    if ($ForegroundBefore -ne [IntPtr]::Zero) {
+        $script:foregroundBeforePetClick = $ForegroundBefore
     }
     Write-PetInteractionState -Action 'pending-single' -At $At
+}
+
+$script:lastPointerFileWriteTicks = 0L
+function Receive-PetPointerEvents {
+    if (-not (Test-Path -LiteralPath $pointerEventPath -PathType Leaf)) {
+        return
+    }
+
+    try {
+        $writeTicks = [IO.File]::GetLastWriteTimeUtc($pointerEventPath).Ticks
+        if ($writeTicks -eq $script:lastPointerFileWriteTicks) { return }
+        $state = Get-Content -LiteralPath $pointerEventPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        $script:lastPointerFileWriteTicks = $writeTicks
+        if ($null -eq $state -or [string]::IsNullOrWhiteSpace([string]$state.sessionId)) {
+            return
+        }
+
+        if ($script:pointerEventSession -ne [string]$state.sessionId) {
+            $script:pointerEventSession = [string]$state.sessionId
+            $script:processedPointerEventIds = @()
+        }
+
+        foreach ($event in @($state.events)) {
+            $eventId = [string]$event.id
+            if ([string]::IsNullOrWhiteSpace($eventId) -or
+                $script:processedPointerEventIds -contains $eventId) {
+                continue
+            }
+
+            $script:processedPointerEventIds = @(
+                @($script:processedPointerEventIds) + $eventId | Select-Object -Last 24
+            )
+            if ([string]$event.kind -eq 'click') {
+                $eventAt = [datetime]::Parse(
+                    [string]$event.at,
+                    [Globalization.CultureInfo]::InvariantCulture,
+                    [Globalization.DateTimeStyles]::RoundtripKind
+                ).ToLocalTime()
+                $foregroundBefore = [IntPtr]::Zero
+                if ($null -ne $event.PSObject.Properties['foregroundBefore']) {
+                    $foregroundBefore = [IntPtr]::new([long]$event.foregroundBefore)
+                }
+                Register-PetClick -At $eventAt -X ([int]$event.x) -Y ([int]$event.y) -ForegroundBefore $foregroundBefore
+            } elseif ([string]$event.kind -eq 'drag') {
+                $script:pendingPetClickAt = $null
+                $now = Get-Date
+                if (($now - $script:lastPetDragAt).TotalSeconds -ge 5) {
+                    Show-PetInteraction -Trigger 'drag'
+                    $script:lastPetDragAt = $now
+                    $script:lastPetHoverAt = $now
+                }
+            }
+        }
+    }
+    catch {
+        # The bridge replaces this tiny file atomically. If antivirus or file
+        # indexing briefly holds it, retry naturally on the next 25 ms tick.
+    }
 }
 
 $app = New-Object System.Windows.Application
@@ -762,7 +1112,13 @@ $hideTimer.Interval = [TimeSpan]::FromSeconds($VisibleSeconds)
 $positionTimer = New-Object System.Windows.Threading.DispatcherTimer
 $positionTimer.Interval = [TimeSpan]::FromMilliseconds(250)
 $positionTimer.Add_Tick({
+    if ([PaperCheer.NativeWindow]::IsInputGestureActive()) { return }
     $script:petHitBounds = Get-PetHitBounds
+    if ($null -eq $script:petHitBounds) {
+        Hide-MissingPetBubble
+        if ($Once) { $app.Shutdown() }
+        return
+    }
     if ($window.Opacity -gt 0.01) {
         Update-BubblePosition
     }
@@ -780,22 +1136,24 @@ $script:pendingPetClickAt = $null
 $script:pendingPetClickX = 0
 $script:pendingPetClickY = 0
 $script:foregroundBeforePetClick = [IntPtr]::Zero
-$script:pendingForegroundRestore = [IntPtr]::Zero
-$script:pendingForegroundRestoreAt = $null
-$script:pendingForegroundRestoreStopAt = $null
 $script:ignorePetClicksUntil = [datetime]::MinValue
 $script:interactionRegisterCount = 0
 $script:interactionHistory = @()
+$script:pointerEventSession = ''
+$script:processedPointerEventIds = @()
 $script:systemDoubleClickMilliseconds = [Math]::Max(200, [int][PaperCheer.NativeWindow]::GetDoubleClickTime())
-# The native Codex pet can relay its second click about one second late after
-# opening the main window. Keep a wider logical pairing window while restoring
-# the previous foreground on the normal Windows double-click schedule.
-$script:doubleClickMilliseconds = [Math]::Max(1600, $script:systemDoubleClickMilliseconds)
+# Windows double-click timing can be unusually high on a machine. Cap the pet's
+# own pairing window so a single speaks promptly without changing system input.
+$script:doubleClickMilliseconds = [Math]::Max(250, [Math]::Min(550, $script:systemDoubleClickMilliseconds))
 $script:petHitBounds = Get-PetHitBounds
 
 $interactionTimer = New-Object System.Windows.Threading.DispatcherTimer
 $interactionTimer.Interval = [TimeSpan]::FromMilliseconds(25)
 $interactionTimer.Add_Tick({
+    if ([PaperCheer.NativeWindow]::IsInputGestureActive()) {
+        $script:petHoverStartedAt = $null
+        return
+    }
     $cursor = New-Object PaperCheer.NativeWindow+POINT
     if (-not [PaperCheer.NativeWindow]::GetCursorPos([ref]$cursor)) {
         return
@@ -809,28 +1167,11 @@ $interactionTimer.Add_Tick({
     $leftButtonState = [int][PaperCheer.NativeWindow]::GetAsyncKeyState(1)
     $leftButtonDown = (($leftButtonState -band 0x8000) -ne 0)
 
-    if ($script:pendingForegroundRestore -ne [IntPtr]::Zero -and
-        $null -ne $script:pendingForegroundRestoreAt -and
-        $now -ge $script:pendingForegroundRestoreAt) {
-        [void][PaperCheer.NativeWindow]::RestoreForegroundWindow($script:pendingForegroundRestore)
-        if ($null -ne $script:pendingForegroundRestoreStopAt -and
-            $now -ge $script:pendingForegroundRestoreStopAt) {
-            $script:pendingForegroundRestore = [IntPtr]::Zero
-            $script:pendingForegroundRestoreAt = $null
-            $script:pendingForegroundRestoreStopAt = $null
-        } else {
-            $script:pendingForegroundRestoreAt = $now.AddMilliseconds(75)
-        }
-    }
+    Receive-PetPointerEvents
 
     if ($null -ne $script:pendingPetClickAt -and
         ($now - $script:pendingPetClickAt).TotalMilliseconds -gt $script:doubleClickMilliseconds) {
         $script:pendingPetClickAt = $null
-        if ($script:pendingForegroundRestore -ne [IntPtr]::Zero) {
-            [void][PaperCheer.NativeWindow]::RestoreForegroundWindow($script:pendingForegroundRestore)
-            $script:pendingForegroundRestoreAt = $now.AddMilliseconds(75)
-            $script:pendingForegroundRestoreStopAt = $now.AddSeconds(2)
-        }
         Write-PetInteractionState -Action 'single' -At $now
         Show-PetInteraction -Trigger 'click'
         $script:lastPetClickAt = $now
@@ -856,31 +1197,57 @@ $interactionTimer.Add_Tick({
         $script:petHoverStartedAt = $null
     }
 
-    if ($leftButtonDown -and -not $script:mouseWasDown) {
-        $script:mouseDownOnPet = $overPet
-        $script:mouseDownX = $cursor.X
-        $script:mouseDownY = $cursor.Y
-    }
-
-    if (-not $leftButtonDown -and $script:mouseWasDown) {
-        if ($script:mouseDownOnPet) {
-            $distance = [Math]::Sqrt([Math]::Pow($cursor.X - $script:mouseDownX, 2) + [Math]::Pow($cursor.Y - $script:mouseDownY, 2))
-            if ($distance -ge 16 -and ($now - $script:lastPetDragAt).TotalSeconds -ge 5) {
-                Show-PetInteraction -Trigger 'drag'
-                $script:lastPetDragAt = $now
-                $script:lastPetHoverAt = $now
-            } elseif ($distance -lt 16) {
-                Register-PetClick -At $now -X $cursor.X -Y $cursor.Y
-            }
-        }
-        $script:mouseDownOnPet = $false
-    }
-
     $script:mouseWasDown = $leftButtonDown
 })
 
 $autoTimer = New-Object System.Windows.Threading.DispatcherTimer
 $autoTimer.Interval = [TimeSpan]::FromSeconds(1)
+$script:lastInputBridgeHealthAt = [DateTime]::MinValue
+
+function Ensure-InputBridgeRunning {
+    $now = Get-Date
+    if (($now - $script:lastInputBridgeHealthAt).TotalSeconds -lt 3) {
+        return
+    }
+    $script:lastInputBridgeHealthAt = $now
+
+    $bridgeProcessId = 0
+    if (Test-Path -LiteralPath $inputBridgePidPath -PathType Leaf) {
+        try {
+            $bridgeProcessIdText = (Get-Content -LiteralPath $inputBridgePidPath -Raw -Encoding UTF8).Trim()
+            if ($bridgeProcessIdText -match '^\d+$') {
+                $bridgeProcessId = [int]$bridgeProcessIdText
+            }
+        }
+        catch {
+            $bridgeProcessId = 0
+        }
+    }
+
+    if ($bridgeProcessId -gt 0) {
+        $bridgeProcess = Get-Process -Id $bridgeProcessId -ErrorAction SilentlyContinue
+        if ($null -ne $bridgeProcess -and @('powershell','pwsh') -contains $bridgeProcess.ProcessName) {
+            return
+        }
+    }
+
+    try {
+        $arguments = @(
+            '-NoProfile',
+            '-ExecutionPolicy', 'Bypass',
+            '-File', ('"{0}"' -f $inputBridgeScript)
+        )
+        $bridgeProcess = Start-Process -FilePath $powershellExecutable -ArgumentList $arguments -WindowStyle Hidden -PassThru
+        [System.IO.File]::WriteAllText(
+            $inputBridgePidPath,
+            [string]$bridgeProcess.Id,
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+    }
+    catch {
+        # Retry on the next health tick without interrupting speech.
+    }
+}
 
 function Show-Message {
     param(
@@ -888,12 +1255,22 @@ function Show-Message {
         [ValidateRange(3, 60)][int]$DisplaySeconds = $VisibleSeconds
     )
 
+    # All automatic, click and manual messages must have a visible pet anchor.
+    if ([PaperCheer.NativeWindow]::IsInputGestureActive()) { return }
+    $script:petHitBounds = Get-PetHitBounds
+    if ($null -eq $script:petHitBounds) {
+        Hide-MissingPetBubble
+        return
+    }
+
     $messageText.Text = [string]$Message.text
+    Update-BubbleContentMeasure
     Update-BubblePosition
     $window.BeginAnimation([System.Windows.UIElement]::OpacityProperty, $null)
     $window.Opacity = 1
     $window.Show()
     $window.Topmost = $true
+    Update-BubbleContentMeasure
     Update-BubblePosition
 
     $script:recentIds = @((@($script:recentIds) + @([string]$Message.id)) | Select-Object -Last $RecentHistorySize)
@@ -933,6 +1310,8 @@ $hideTimer.Add_Tick({
 
 $script:nextAt = (Get-Date).AddSeconds((Get-Random -Minimum $MinIntervalSeconds -Maximum ($MaxIntervalSeconds + 1)))
 $autoTimer.Add_Tick({
+    Ensure-InputBridgeRunning
+    if ([PaperCheer.NativeWindow]::IsInputGestureActive()) { return }
     $manualCommand = Take-ManualCommand
     if ($null -ne $manualCommand) {
         $manualTrigger = [string]$manualCommand.trigger
@@ -971,7 +1350,24 @@ $autoTimer.Add_Tick({
 $window.Add_SourceInitialized({
     $helper = New-Object System.Windows.Interop.WindowInteropHelper($window)
     $script:bubbleHandle = $helper.Handle
+    Set-ResponsiveBubbleMetrics -BubbleHandle $script:bubbleHandle
     [PaperCheer.NativeWindow]::MakeClickThrough($script:bubbleHandle)
+    $script:bubbleSource = [System.Windows.Interop.HwndSource]::FromHwnd($script:bubbleHandle)
+    $script:pointerMessageHook = [System.Windows.Interop.HwndSourceHook]{
+        param(
+            [IntPtr]$Hwnd,
+            [int]$Message,
+            [IntPtr]$WParam,
+            [IntPtr]$LParam,
+            [ref]$Handled
+        )
+        if ($Message -eq 0x8001 -and -not [PaperCheer.NativeWindow]::IsInputGestureActive()) {
+            Receive-PetPointerEvents
+            $Handled.Value = $true
+        }
+        return [IntPtr]::Zero
+    }
+    $script:bubbleSource.AddHook($script:pointerMessageHook)
 })
 
 $window.Add_Closed({
@@ -979,6 +1375,9 @@ $window.Add_Closed({
     $interactionTimer.Stop()
     $autoTimer.Stop()
     $hideTimer.Stop()
+    if ($null -ne $script:bubbleSource -and $null -ne $script:pointerMessageHook) {
+        $script:bubbleSource.RemoveHook($script:pointerMessageHook)
+    }
     $app.Shutdown()
 })
 
@@ -988,5 +1387,10 @@ $interactionTimer.Start()
 $autoTimer.Start()
 $initialSeconds = Get-Random -Minimum 12 -Maximum 18
 Show-Message -Message (Select-Message -Trigger $InitialTrigger) -DisplaySeconds $initialSeconds
+
+if ($Once -and -not $window.IsVisible) {
+    $window.Close()
+    return
+}
 
 [void]$app.Run()

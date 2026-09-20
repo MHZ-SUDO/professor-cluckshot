@@ -5,6 +5,11 @@ codex-pet-input-bridge-state.json
 paper-cheer-last-message.json
 paper-cheer-overlay-state.json
 paper-cheer-command.json
+paper-cheer-pointer-events.json
+paper-cheer-interaction-state.json
+codex-pet-input-bridge-error.json
+paper-cheer-overlay-error.json
+*-error.json
 
 # Local QA and source assets
 qa/
@@ -15,6 +20,7 @@ spritesheet-clean.png
 # Logs and temporary files
 *.log
 *.tmp
+tests/*-regression.json
 
 # Editor and OS files
 .DS_Store
