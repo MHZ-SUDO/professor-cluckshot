@@ -66,6 +66,28 @@ function Write-PidFile {
     [System.IO.File]::WriteAllText($Path, [string]$ProcessId, (New-Object System.Text.UTF8Encoding($false)))
 }
 
+function Start-DetachedPetProcess {
+    param(
+        [Parameter(Mandatory = $true)][string]$CommandLine,
+        [Parameter(Mandatory = $true)][string]$WorkingDirectory
+    )
+
+    # Start-Process inherits the caller's job. A Codex update can then stop both
+    # helpers. Local WMI creation keeps the resident helpers outside that job.
+    $startupInfo = New-CimInstance -ClassName Win32_ProcessStartup -ClientOnly -Property @{
+        ShowWindow = [uint16]0
+    }
+    $created = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{
+        CommandLine = $CommandLine
+        CurrentDirectory = $WorkingDirectory
+        ProcessStartupInformation = $startupInfo
+    } -ErrorAction Stop
+    if ($created.ReturnValue -ne 0 -or $created.ProcessId -le 0) {
+        throw "无法独立启动宠物助手，Windows 返回码：$($created.ReturnValue)"
+    }
+    return [int]$created.ProcessId
+}
+
 function Start-Sidecar {
     param(
         [string]$ScriptPath,
@@ -91,9 +113,11 @@ function Start-Sidecar {
     $arguments += @('-File', ('"{0}"' -f $ScriptPath))
     $arguments += $ExtraArguments
 
-    $process = Start-Process -FilePath $powershell -ArgumentList $arguments -WindowStyle Hidden -PassThru
+    $commandLine = '"{0}" {1}' -f $powershell, ($arguments -join ' ')
+    $startedProcessId = Start-DetachedPetProcess -CommandLine $commandLine -WorkingDirectory $PSScriptRoot
     Start-Sleep -Milliseconds 250
-    if ($process.HasExited) {
+    $process = Get-Process -Id $startedProcessId -ErrorAction SilentlyContinue
+    if ($null -eq $process -or $process.HasExited) {
         throw "运行脚本启动后立即退出：$ScriptPath"
     }
 

@@ -994,8 +994,7 @@ function Write-PetInteractionState {
         registerCount = $script:interactionRegisterCount
         foregroundBeforeClick = $script:foregroundBeforePetClick.ToInt64()
         restoreWindow = 0
-        focusPolicy = 'single-click-no-window-mutation'
-        doubleClickMilliseconds = $script:doubleClickMilliseconds
+        focusPolicy = 'native-click-with-immediate-speech'
         history = $script:interactionHistory
     }
     [System.IO.File]::WriteAllText(
@@ -1013,36 +1012,16 @@ function Register-PetClick {
         [IntPtr]$ForegroundBefore = [IntPtr]::Zero
     )
 
-    if ($At -lt $script:ignorePetClicksUntil) {
-        return
-    }
-
-    if ($null -ne $script:pendingPetClickAt) {
-        $elapsed = ($At - $script:pendingPetClickAt).TotalMilliseconds
-        $distance = [Math]::Sqrt(
-            [Math]::Pow($X - $script:pendingPetClickX, 2) +
-            [Math]::Pow($Y - $script:pendingPetClickY, 2)
-        )
-        if ($elapsed -le $script:doubleClickMilliseconds -and $distance -lt 16) {
-            $script:pendingPetClickAt = $null
-            # The native pet may emit one delayed relay more than two seconds
-            # after a completed double-click. Ignore that tail event so it
-            # cannot turn the successful double-click back into a single.
-            $script:ignorePetClicksUntil = $At.AddSeconds(3)
-            $script:lastPetClickAt = $At
-            Write-PetInteractionState -Action 'double' -At $At
-            [void][PaperCheer.NativeWindow]::ActivateCodexMainWindow()
-            return
-        }
-    }
-
-    $script:pendingPetClickAt = $At
-    $script:pendingPetClickX = $X
-    $script:pendingPetClickY = $Y
+    # Native input already owns the click and focus behavior. Waiting for a
+    # double click only delays speech and used to silence the next three seconds.
     if ($ForegroundBefore -ne [IntPtr]::Zero) {
         $script:foregroundBeforePetClick = $ForegroundBefore
     }
-    Write-PetInteractionState -Action 'pending-single' -At $At
+    Write-PetInteractionState -Action 'single' -At $At
+    Show-PetInteraction -Trigger 'click'
+    $script:lastPetClickAt = $At
+    $script:lastPetHoverAt = $At
+    $script:petHoverStartedAt = Get-Date
 }
 
 $script:lastPointerFileWriteTicks = 0L
@@ -1136,7 +1115,6 @@ $script:pendingPetClickAt = $null
 $script:pendingPetClickX = 0
 $script:pendingPetClickY = 0
 $script:foregroundBeforePetClick = [IntPtr]::Zero
-$script:ignorePetClicksUntil = [datetime]::MinValue
 $script:interactionRegisterCount = 0
 $script:interactionHistory = @()
 $script:pointerEventSession = ''
@@ -1144,7 +1122,6 @@ $script:processedPointerEventIds = @()
 $script:systemDoubleClickMilliseconds = [Math]::Max(200, [int][PaperCheer.NativeWindow]::GetDoubleClickTime())
 # Windows double-click timing can be unusually high on a machine. Cap the pet's
 # own pairing window so a single speaks promptly without changing system input.
-$script:doubleClickMilliseconds = [Math]::Max(250, [Math]::Min(550, $script:systemDoubleClickMilliseconds))
 $script:petHitBounds = Get-PetHitBounds
 
 $interactionTimer = New-Object System.Windows.Threading.DispatcherTimer
@@ -1169,14 +1146,6 @@ $interactionTimer.Add_Tick({
 
     Receive-PetPointerEvents
 
-    if ($null -ne $script:pendingPetClickAt -and
-        ($now - $script:pendingPetClickAt).TotalMilliseconds -gt $script:doubleClickMilliseconds) {
-        $script:pendingPetClickAt = $null
-        Write-PetInteractionState -Action 'single' -At $now
-        Show-PetInteraction -Trigger 'click'
-        $script:lastPetClickAt = $now
-        $script:lastPetHoverAt = $now
-    }
 
     if ($overPet -and -not $leftButtonDown) {
         # Capture the window that was active while the pointer was merely
