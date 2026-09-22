@@ -37,7 +37,7 @@ Professor Cluckshot is a basketball-loving research chicken for the Codex deskto
 
 助手改为独立后台启动，避免随启动它的 Codex 进程一起结束。收到点击事件后立即触发说话，取消原先的双击等待和双击后 3 秒的点击忽略；Codex 原生单击仍可能唤起主窗口。
 
-已通过进程生命周期隔离、点击处理回归和本机气泡显示检查。连续拖动、跨屏手感与截图软件配合仍需人工确认。具体变更见 [CHANGELOG.md](CHANGELOG.md)。
+已通过进程生命周期隔离、点击处理回归和本机气泡显示检查。2026-09-22，使用者确认当前版本的点击、说话和拖拽均正常。跨屏切换与第三方截图软件配合尚未单独验收。具体变更见 [CHANGELOG.md](CHANGELOG.md)。
 
 ## 系统要求
 
