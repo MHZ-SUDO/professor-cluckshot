@@ -108,6 +108,8 @@ public static class ProfessorCluckshotInputNative
 
     [DllImport("user32.dll")]
     public static extern bool IsWindowVisible(IntPtr hwnd);
+    [DllImport("user32.dll")]
+    private static extern uint GetDpiForWindow(IntPtr hwnd);
 
     [DllImport("user32.dll")]
     public static extern bool GetWindowRect(IntPtr hwnd, out RECT rect);
@@ -117,6 +119,64 @@ public static class ProfessorCluckshotInputNative
 
     [DllImport("user32.dll")]
     public static extern bool ScreenToClient(IntPtr hwnd, ref POINT point);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern ushort RegisterClass(ref WNDCLASS windowClass);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern IntPtr CreateWindowEx(uint exStyle, string className, string title,
+        uint style, int x, int y, int width, int height, IntPtr parent, IntPtr menu,
+        IntPtr instance, IntPtr parameter);
+    [DllImport("user32.dll", EntryPoint = "DefWindowProcW", CharSet = CharSet.Unicode)]
+    private static extern IntPtr DefWindowProc(IntPtr hwnd, uint message, IntPtr wParam, IntPtr lParam);
+    [DllImport("user32.dll")]
+    private static extern bool DestroyWindow(IntPtr hwnd);
+    [DllImport("user32.dll")]
+    private static extern void PostQuitMessage(int exitCode);
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool SetLayeredWindowAttributes(IntPtr window, uint key, byte alpha, uint flags);
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool SetWindowPos(IntPtr window, IntPtr after, int x, int y,
+        int width, int height, uint flags);
+    [DllImport("user32.dll")]
+    private static extern IntPtr SetCapture(IntPtr window);
+    [DllImport("user32.dll")]
+    private static extern bool ReleaseCapture();
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetCapture();
+    [DllImport("user32.dll")]
+    private static extern UIntPtr SetTimer(IntPtr window, UIntPtr timerId, uint milliseconds, IntPtr callback);
+    [DllImport("user32.dll")]
+    private static extern bool KillTimer(IntPtr window, UIntPtr timerId);
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern IntPtr SendMessageTimeout(IntPtr window, uint message,
+        IntPtr wParam, IntPtr lParam, uint flags, uint timeoutMs, out UIntPtr result);
+    [DllImport("gdi32.dll")]
+    private static extern IntPtr CreateRectRgn(int left, int top, int right, int bottom);
+    [DllImport("gdi32.dll")]
+    private static extern int CombineRgn(IntPtr destination, IntPtr first, IntPtr second, int mode);
+    [DllImport("gdi32.dll")]
+    private static extern bool DeleteObject(IntPtr objectHandle);
+    [DllImport("user32.dll")]
+    private static extern int SetWindowRgn(IntPtr window, IntPtr region, bool redraw);
+
+    private delegate IntPtr ShieldWindowProc(IntPtr hwnd, uint message, IntPtr wParam, IntPtr lParam);
+    [StructLayout(LayoutKind.Sequential)]
+    private struct TRACKMOUSEEVENT {
+        public int Size;
+        public uint Flags;
+        public IntPtr Window;
+        public uint HoverTime;
+    }
+    [DllImport("user32.dll")]
+    private static extern bool TrackMouseEvent(ref TRACKMOUSEEVENT request);
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct WNDCLASS {
+        public uint Style;
+        public ShieldWindowProc Callback;
+        public int ClassExtra, WindowExtra;
+        public IntPtr Instance, Icon, Cursor, Background;
+        public string Menu, Name;
+    }
 
     [DllImport("user32.dll")]
     public static extern short GetAsyncKeyState(int virtualKey);
@@ -201,6 +261,8 @@ public static class ProfessorCluckshotInputNative
 
     [DllImport("user32.dll")]
     public static extern IntPtr MonitorFromWindow(IntPtr hwnd, uint flags);
+    [DllImport("user32.dll")]
+    private static extern IntPtr MonitorFromPoint(POINT point, uint flags);
 
     [DllImport("user32.dll")]
     public static extern bool GetMonitorInfo(IntPtr monitor, ref MONITORINFO info);
@@ -224,6 +286,19 @@ public static class ProfessorCluckshotInputNative
     private const int WM_MOUSEMOVE = 0x0200;
     private const int WM_LBUTTONDOWN = 0x0201;
     private const int WM_LBUTTONUP = 0x0202;
+    private const int WM_RBUTTONDOWN = 0x0204;
+    private const int WM_RBUTTONUP = 0x0205;
+    private const int WM_CONTEXTMENU = 0x007b;
+    private const int WM_TIMER = 0x0113;
+    private const int WM_MOUSEACTIVATE = 0x0021;
+    private const int WM_NCHITTEST = 0x0084;
+    private const int WM_CLOSE = 0x0010;
+    private const int WM_DESTROY = 0x0002;
+    private const int WM_CAPTURECHANGED = 0x0215;
+    private const int WM_MOUSELEAVE = 0x02a3;
+    private const int WM_SHIELD_REFRESH = 0x8031;
+    private const int WM_SHIELD_STOP = 0x8032;
+    private const int WM_SHIELD_FINISH_UP = 0x8033;
     private const uint WM_QUIT = 0x0012;
     private const long BODY_DRAG_THRESHOLD_SQUARED = 64L;
     private static readonly IntPtr DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = new IntPtr(-4);
@@ -238,12 +313,42 @@ public static class ProfessorCluckshotInputNative
     private static string MouseHookException = String.Empty;
     private static int MouseBodyInputSuppressionCount;
 
+    // The almost invisible input window owns only stationary body clicks. Its
+    // window thread receives real hardware messages in their original order.
+    private static readonly ManualResetEvent ShieldReady = new ManualResetEvent(false);
+    private static readonly ShieldWindowProc ShieldProcedure = ShieldCallback;
+    private static Thread ShieldThread;
+    private static uint ShieldThreadId;
+    private static IntPtr ShieldWindow;
+    private static string ShieldError = String.Empty;
+    private static bool ShieldVisible;
+    private static RECT ShieldBounds;
+    private static int ShieldState; // 0 idle, 1 shield capture, 2 handoff, 3 canceled, 4 physical UP pending delivery
+    private static bool ShieldSendingHandoff;
+    private static POINT ShieldStart;
+    private static int ShieldDragThresholdPhysical = 5;
+    private static IntPtr ShieldOverlay, ShieldRenderer;
+    private static RECT ShieldOverlayBoundsAtDown;
+    private static RECT ShieldBodyBoundsAtDown;
+    private static IntPtr ShieldPlacedOverlay;
+    private static POINT ShieldLastUp;
+    private static long ShieldReleaseDeadline;
+    private static long ShieldRequireTargetAfter;
+    private static long ShieldForeground;
+    private static int ShieldShowState;
+    private static long ShieldClicks, ShieldNativeDrags, ShieldHandoffFailures, DeliveredMoveCount;
+    private static long LatestDragPointPacked, LastRelayedDragPointPacked;
+    private static int ShieldLastSendError;
+    private static string ShieldLastResult = String.Empty;
+    private static bool ShieldTrackingMouse;
+    private static IntPtr ShieldHoverRenderer;
+
     // One immutable publication prevents mixed X/Y bounds during a display change.
     private sealed class PetTarget {
         public IntPtr Overlay, Renderer;
         public RECT Body;
         public RECT[] Buttons;
-        public long ExpiresAt;
+        public long PublishedAt, ExpiresAt;
     }
     private static PetTarget CurrentTarget;
     private static bool GestureIsButton;
@@ -268,14 +373,27 @@ public static class ProfessorCluckshotInputNative
         public long CompletedGestures { get; set; }
         public int PendingGestures { get; set; }
         public string LastError { get; set; }
+        public long ShieldClicks { get; set; }
+        public long ShieldNativeDrags { get; set; }
+        public long ShieldHandoffFailures { get; set; }
+        public int ShieldLastSendError { get; set; }
+        public string ShieldLastResult { get; set; }
+        public bool ShieldVisible { get; set; }
     }
     public static RelayDiagnostics GetRelayDiagnostics() {
         return new RelayDiagnostics { InputMoves = Interlocked.Read(ref InputMoveCount),
-            DeliveredMoves = 0, CompletedGestures = Interlocked.Read(ref CompletedGestureCount),
-            PendingGestures = 0, LastError = String.Empty };
+            DeliveredMoves = Interlocked.Read(ref DeliveredMoveCount), CompletedGestures = Interlocked.Read(ref CompletedGestureCount),
+            PendingGestures = 0, LastError = ShieldError,
+            ShieldClicks = Interlocked.Read(ref ShieldClicks),
+            ShieldNativeDrags = Interlocked.Read(ref ShieldNativeDrags),
+            ShieldHandoffFailures = Interlocked.Read(ref ShieldHandoffFailures),
+            ShieldLastSendError = Volatile.Read(ref ShieldLastSendError),
+            ShieldLastResult = ShieldLastResult,
+            ShieldVisible = ShieldVisible };
     }
     public static bool IsInteractionBusy() {
-        return IsGestureActive() || DateTime.UtcNow.Ticks < Interlocked.Read(ref SettleUntil);
+        return IsGestureActive() || Volatile.Read(ref ShieldState) == 4 ||
+            DateTime.UtcNow.Ticks < Interlocked.Read(ref SettleUntil);
     }
     private static void SetGestureActive(bool active) {
         Volatile.Write(ref GestureActive, active ? 1 : 0);
@@ -322,16 +440,20 @@ public static class ProfessorCluckshotInputNative
             for (int i = 0; i + 3 < buttons.Length; i += 4)
                 controls.Add(new RECT { Left = buttons[i], Top = buttons[i+1], Right = buttons[i+2], Bottom = buttons[i+3] });
         }
+        long publishedAt = DateTime.UtcNow.Ticks;
         Volatile.Write(ref CurrentTarget, new PetTarget {
             Overlay = overlay, Renderer = FindRenderer(overlay),
             Body = new RECT { Left = body[0], Top = body[1], Right = body[2], Bottom = body[3] },
-            Buttons = controls.ToArray(), ExpiresAt = DateTime.UtcNow.AddMilliseconds(600).Ticks
+            Buttons = controls.ToArray(), PublishedAt = publishedAt,
+            ExpiresAt = publishedAt + TimeSpan.FromMilliseconds(600).Ticks
         });
+        RefreshShield();
     }
 
     public static void ClearPetBodyClickGuard() {
         // A transient accessibility refresh must not cancel an already owned drag.
         Volatile.Write(ref CurrentTarget, null);
+        RefreshShield();
     }
     public static bool IsGestureActive() { return Volatile.Read(ref GestureActive) != 0; }
     public static int GetBodyInputSuppressionCount() { return Volatile.Read(ref MouseBodyInputSuppressionCount); }
@@ -343,13 +465,15 @@ public static class ProfessorCluckshotInputNative
         if (overlay == IntPtr.Zero || !IsWindow(overlay) || !IsWindowVisible(overlay)) return false;
         GUITHREADINFO info = new GUITHREADINFO();
         info.Size = Marshal.SizeOf(typeof(GUITHREADINFO));
-        if (GetGUIThreadInfo(0, ref info) && info.Capture != IntPtr.Zero && GetAncestor(info.Capture, 2) != overlay)
+        if (GetGUIThreadInfo(0, ref info) && info.Capture != IntPtr.Zero &&
+            info.Capture != ShieldWindow && GetAncestor(info.Capture, 2) != overlay)
             return false;
         // Respect screenshot selection surfaces and any other covering window.
         // WindowFromPoint alone cannot distinguish an occluder from the window
         // below our deliberately click-through pet.
         IntPtr above = GetWindow(overlay, 3); // GW_HWNDPREV, toward top of Z order
         for (int count = 0; above != IntPtr.Zero && count < 512; count++, above = GetWindow(above, 3)) {
+            if (above == ShieldWindow) continue;
             if (!IsWindowVisible(above) || (GetWindowLongPtr(above, -20).ToInt64() & 0x20L) != 0) continue;
             RECT rect;
             if (!GetWindowRect(above, out rect) || !Contains(rect, point)) continue;
@@ -360,12 +484,502 @@ public static class ProfessorCluckshotInputNative
         return true;
     }
 
+    private static void RefreshShield() {
+        uint thread = ShieldThreadId;
+        if (thread != 0) PostThreadMessage(thread, WM_SHIELD_REFRESH, UIntPtr.Zero, IntPtr.Zero);
+    }
+    public static bool StartClickShield() {
+        if (ShieldThread != null && ShieldThread.IsAlive && ShieldWindow != IntPtr.Zero) return true;
+        ShieldReady.Reset(); ShieldError = String.Empty;
+        ShieldThread = new Thread(ShieldThreadMain);
+        ShieldThread.IsBackground = true;
+        ShieldThread.Name = "Professor Cluckshot click shield";
+        ShieldThread.Start();
+        return ShieldReady.WaitOne(2000) && ShieldWindow != IntPtr.Zero;
+    }
+    public static void StopClickShield() {
+        uint threadId = ShieldThreadId;
+        Thread thread = ShieldThread;
+        if (threadId != 0) PostThreadMessage(threadId, WM_SHIELD_STOP, UIntPtr.Zero, IntPtr.Zero);
+        if (thread != null && thread != Thread.CurrentThread && thread.IsAlive) thread.Join(1500);
+    }
+    public static string GetClickShieldError() { return ShieldError; }
+    public static bool IsClickShieldActive() { return ShieldWindow != IntPtr.Zero && ShieldThread != null && ShieldThread.IsAlive; }
+    private static void ShieldThreadMain() {
+        try {
+            EnablePerMonitorV2ForCurrentThread();
+            ShieldThreadId = GetCurrentThreadId();
+            string className = "ProfessorCluckshotClickShield_" + Guid.NewGuid().ToString("N");
+            var windowClass = new WNDCLASS { Callback = ShieldProcedure, Name = className };
+            if (RegisterClass(ref windowClass) == 0)
+                throw new InvalidOperationException("RegisterClass: " + Marshal.GetLastWin32Error());
+            IntPtr window = CreateWindowEx(0x00080000U | 0x00000080U | 0x08000000U | 0x00000008U,
+                className, "Professor Cluckshot Click Shield", 0x80000000U,
+                0, 0, 1, 1, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
+            if (window == IntPtr.Zero)
+                throw new InvalidOperationException("CreateWindowEx: " + Marshal.GetLastWin32Error());
+            ShieldWindow = window;
+            if (!SetLayeredWindowAttributes(window, 0, 1, 2))
+                throw new InvalidOperationException("SetLayeredWindowAttributes: " + Marshal.GetLastWin32Error());
+            ShieldReady.Set();
+            MSG message;
+            while (GetMessage(out message, IntPtr.Zero, 0, 0) > 0) {
+                if (message.Message == WM_SHIELD_REFRESH) { RefreshShieldOnThread(); continue; }
+                if (message.Message == WM_SHIELD_FINISH_UP) { FinishNativeUpOnShieldThread(); continue; }
+                if (message.Message == WM_SHIELD_STOP) break;
+                TranslateMessage(ref message); DispatchMessage(ref message);
+            }
+            if (GetCapture() == window) ReleaseCapture();
+            DestroyWindow(window);
+        } catch (Exception error) {
+            ShieldError = error.ToString(); ShieldReady.Set();
+        } finally {
+            ShieldWindow = IntPtr.Zero;
+            ShieldVisible = false;
+            ShieldThreadId = 0;
+            Volatile.Write(ref ShieldState, 0);
+            SetGestureActive(false);
+        }
+    }
+    private static bool SameRect(RECT first, RECT second) {
+        return first.Left == second.Left && first.Top == second.Top &&
+            first.Right == second.Right && first.Bottom == second.Bottom;
+    }
+    private static bool ShieldAboveOverlay(IntPtr overlay) {
+        for (IntPtr above = GetWindow(overlay, 3); above != IntPtr.Zero; above = GetWindow(above, 3))
+            if (above == ShieldWindow) return true;
+        return false;
+    }
+    private static void ApplyShieldRegion(PetTarget target) {
+        int width = target.Body.Right - target.Body.Left;
+        int height = target.Body.Bottom - target.Body.Top;
+        IntPtr region = CreateRectRgn(0, 0, width, height);
+        if (region == IntPtr.Zero) return;
+        foreach (RECT button in target.Buttons) {
+            IntPtr exclusion = CreateRectRgn(button.Left - target.Body.Left,
+                button.Top - target.Body.Top, button.Right - target.Body.Left,
+                button.Bottom - target.Body.Top);
+            if (exclusion != IntPtr.Zero) {
+                CombineRgn(region, region, exclusion, 4); // RGN_DIFF
+                DeleteObject(exclusion);
+            }
+        }
+        if (SetWindowRgn(ShieldWindow, region, false) == 0) DeleteObject(region);
+    }
+    private static void RefreshShieldOnThread() {
+        if (ShieldWindow == IntPtr.Zero || Volatile.Read(ref ShieldState) != 0) return;
+        PetTarget target = Volatile.Read(ref CurrentTarget);
+        bool fresh = target != null && DateTime.UtcNow.Ticks <= target.ExpiresAt &&
+            target.PublishedAt > Interlocked.Read(ref ShieldRequireTargetAfter);
+        int width = fresh ? target.Body.Right - target.Body.Left : 0;
+        int height = fresh ? target.Body.Bottom - target.Body.Top : 0;
+        POINT center = fresh ? new POINT {
+            X = target.Body.Left + width / 2, Y = target.Body.Top + height / 2
+        } : new POINT();
+        bool usable = fresh && width > 0 && height > 0 && width <= 500 && height <= 500 &&
+            target.Renderer != IntPtr.Zero && IsWindow(target.Renderer) &&
+            GetAncestor(target.Renderer, 2) == target.Overlay &&
+            IsPetPointUnobscured(target.Overlay, center);
+        if (!usable) {
+            if (ShieldVisible) {
+                EndShieldHover();
+                SetWindowPos(ShieldWindow, IntPtr.Zero, 0, 0, 0, 0, 0x0080U | 0x0001U | 0x0002U | 0x0010U);
+            }
+            ShieldVisible = false;
+            return;
+        }
+        bool needsPlacement = !ShieldVisible || !SameRect(ShieldBounds, target.Body) ||
+            !ShieldAboveOverlay(target.Overlay);
+        if (needsPlacement) {
+            EndShieldHover();
+            // Insert directly above the pet. Other already-visible selection
+            // surfaces keep their place above this input window.
+            IntPtr abovePet = GetWindow(target.Overlay, 3);
+            IntPtr after = abovePet == ShieldWindow ? GetWindow(ShieldWindow, 3) : abovePet;
+            if (after == IntPtr.Zero) after = new IntPtr(-1);
+            if (SetWindowPos(ShieldWindow, after, target.Body.Left, target.Body.Top,
+                width, height, 0x0010U | 0x0040U | 0x0200U)) {
+                ShieldBounds = target.Body;
+                ShieldPlacedOverlay = target.Overlay;
+                ShieldVisible = true;
+            } else {
+                ShieldError = "SetWindowPos shield: " + Marshal.GetLastWin32Error();
+                ShieldVisible = false;
+            }
+        }
+        if (ShieldVisible) ShieldPlacedOverlay = target.Overlay;
+        if (ShieldVisible) ApplyShieldRegion(target);
+    }
+    private static bool SendToPetRaw(uint message, int x, int y, IntPtr flags) {
+        if (ShieldRenderer == IntPtr.Zero || !IsWindow(ShieldRenderer) ||
+            GetAncestor(ShieldRenderer, 2) != ShieldOverlay) return false;
+        POINT client = new POINT { X = x, Y = y };
+        if (!ScreenToClient(ShieldRenderer, ref client) ||
+            client.X < Int16.MinValue || client.X > Int16.MaxValue ||
+            client.Y < Int16.MinValue || client.Y > Int16.MaxValue) return false;
+        UIntPtr ignored;
+        bool sent = SendMessageTimeout(ShieldRenderer, message, flags,
+            MakeMouseLParam(client.X, client.Y), 0x23U, 100, out ignored) != IntPtr.Zero;
+        Volatile.Write(ref ShieldLastSendError, sent ? 0 : Marshal.GetLastWin32Error());
+        return sent;
+    }
+    private static bool SendToPet(uint message, int x, int y, bool pressed) {
+        return SendToPetRaw(message, x, y, pressed ? new IntPtr(1) : IntPtr.Zero);
+    }
+    private static long PackPoint(POINT point) {
+        return unchecked(((long)(uint)point.X << 32) | (uint)point.Y);
+    }
+    private static POINT UnpackPoint(long packed) {
+        return new POINT { X = unchecked((int)(packed >> 32)), Y = unchecked((int)packed) };
+    }
+    private static void ForwardLatestDragMove() {
+        long latest = Interlocked.Read(ref LatestDragPointPacked);
+        if (latest == Interlocked.Read(ref LastRelayedDragPointPacked)) return;
+        POINT point = UnpackPoint(latest);
+        if (SendToPet(WM_MOUSEMOVE, point.X, point.Y, true)) {
+            Interlocked.Exchange(ref LastRelayedDragPointPacked, latest);
+            Interlocked.Increment(ref DeliveredMoveCount);
+        }
+    }
+    private static void QueueFinalDragMove(POINT position) {
+        IntPtr renderer = ShieldRenderer;
+        if (renderer == IntPtr.Zero || !IsWindow(renderer) ||
+            GetAncestor(renderer, 2) != ShieldOverlay) return;
+        POINT client = position;
+        if (!ScreenToClient(renderer, ref client) ||
+            client.X < Int16.MinValue || client.X > Int16.MaxValue ||
+            client.Y < Int16.MinValue || client.Y > Int16.MaxValue) return;
+        if (PostMessage(renderer, WM_MOUSEMOVE, new IntPtr(1),
+            MakeMouseLParam(client.X, client.Y)))
+            Interlocked.Increment(ref DeliveredMoveCount);
+        else Volatile.Write(ref ShieldLastSendError, Marshal.GetLastWin32Error());
+    }
+    private static bool PhysicalLeftHeld() { return GetAsyncKeyState(1) < 0; }
+    private static int PhysicalDragThreshold(IntPtr overlay) {
+        uint dpi = 96;
+        try { dpi = GetDpiForWindow(overlay); }
+        catch (EntryPointNotFoundException) { dpi = 96; }
+        if (dpi < 96) dpi = 96;
+        // The pet's JavaScript checks >=4 CSS pixels per axis. Add one
+        // physical pixel so rounding at 125%, 150%, etc. cannot turn a
+        // handed-off drag back into a native click.
+        return Math.Max(5, (int)Math.Ceiling(4.0 * dpi / 96.0) + 1);
+    }
+    private static void PositionShieldAfterNativeDrag() {
+        IntPtr overlay = ShieldOverlay;
+        RECT currentOverlay;
+        if (ShieldWindow == IntPtr.Zero || overlay == IntPtr.Zero ||
+            !IsWindowVisible(overlay) || !GetWindowRect(overlay, out currentOverlay) ||
+            ShieldOverlayBoundsAtDown.Right <= ShieldOverlayBoundsAtDown.Left) {
+            HideShieldOnThread();
+            return;
+        }
+        int dx = currentOverlay.Left - ShieldOverlayBoundsAtDown.Left;
+        int dy = currentOverlay.Top - ShieldOverlayBoundsAtDown.Top;
+        if (dx == 0) dx = ShieldLastUp.X - ShieldStart.X;
+        if (dy == 0) dy = ShieldLastUp.Y - ShieldStart.Y;
+        int width = ShieldBodyBoundsAtDown.Right - ShieldBodyBoundsAtDown.Left;
+        int height = ShieldBodyBoundsAtDown.Bottom - ShieldBodyBoundsAtDown.Top;
+        RECT predicted = new RECT {
+            Left = ShieldBodyBoundsAtDown.Left + dx, Top = ShieldBodyBoundsAtDown.Top + dy,
+            Right = ShieldBodyBoundsAtDown.Right + dx, Bottom = ShieldBodyBoundsAtDown.Bottom + dy
+        };
+        IntPtr monitor = MonitorFromPoint(ShieldLastUp, 2);
+        MONITORINFO monitorInfo = new MONITORINFO { Size = Marshal.SizeOf(typeof(MONITORINFO)) };
+        if (monitor != IntPtr.Zero && GetMonitorInfo(monitor, ref monitorInfo) &&
+            width <= monitorInfo.Work.Right - monitorInfo.Work.Left &&
+            height <= monitorInfo.Work.Bottom - monitorInfo.Work.Top) {
+            predicted.Left = Math.Max(monitorInfo.Work.Left,
+                Math.Min(predicted.Left, monitorInfo.Work.Right - width));
+            predicted.Top = Math.Max(monitorInfo.Work.Top,
+                Math.Min(predicted.Top, monitorInfo.Work.Bottom - height));
+            predicted.Right = predicted.Left + width;
+            predicted.Bottom = predicted.Top + height;
+        }
+        POINT center = new POINT { X = predicted.Left + (predicted.Right - predicted.Left) / 2,
+            Y = predicted.Top + (predicted.Bottom - predicted.Top) / 2 };
+        if (!IsPetPointUnobscured(overlay, center)) { HideShieldOnThread(); return; }
+        IntPtr abovePet = GetWindow(overlay, 3);
+        IntPtr after = abovePet == ShieldWindow ? GetWindow(ShieldWindow, 3) : abovePet;
+        if (after == IntPtr.Zero) after = new IntPtr(-1);
+        if (!SetWindowPos(ShieldWindow, after, predicted.Left, predicted.Top,
+            predicted.Right - predicted.Left, predicted.Bottom - predicted.Top,
+            0x0010U | 0x0040U | 0x0200U)) {
+            ShieldError = "SetWindowPos after drag: " + Marshal.GetLastWin32Error();
+            HideShieldOnThread();
+            return;
+        }
+        ShieldBounds = predicted;
+        ShieldPlacedOverlay = overlay;
+        ShieldVisible = true;
+        PetTarget oldTarget = Volatile.Read(ref CurrentTarget);
+        if (oldTarget != null && oldTarget.Overlay == overlay) ApplyShieldRegion(oldTarget);
+    }
+    private static void HideShieldOnThread() {
+        if (ShieldVisible && ShieldWindow != IntPtr.Zero) {
+            EndShieldHover();
+            SetWindowPos(ShieldWindow, IntPtr.Zero, 0, 0, 0, 0,
+                0x0080U | 0x0001U | 0x0002U | 0x0010U);
+        }
+        ShieldVisible = false;
+    }
+    private static void FinishNativeUpOnShieldThread() {
+        if (Volatile.Read(ref ShieldState) != 4) return;
+        KillTimer(ShieldWindow, new UIntPtr(2));
+        // Give the actual hardware UP an opportunity to reach Chromium in
+        // order. The final queued MOVE must precede the fallback UP.
+        if (SetTimer(ShieldWindow, new UIntPtr(1), 20, IntPtr.Zero) == UIntPtr.Zero)
+            FinishNativeUpAfterTimer();
+    }
+    private static void FinishNativeUpAfterTimer() {
+        if (Interlocked.CompareExchange(ref ShieldState, 0, 4) != 4) return;
+        if (ShieldRenderer != IntPtr.Zero && IsWindow(ShieldRenderer))
+            PostMessage(ShieldRenderer, WM_LBUTTONUP, IntPtr.Zero,
+                NativePosition(ShieldRenderer, ShieldLastUp.X, ShieldLastUp.Y));
+        PositionShieldAfterNativeDrag();
+    }
+    public static void ReconcileShieldRelease() {
+        if (Volatile.Read(ref ShieldState) != 4 ||
+            DateTime.UtcNow.Ticks < Interlocked.Read(ref ShieldReleaseDeadline)) return;
+        if (Interlocked.CompareExchange(ref ShieldState, 0, 4) != 4) return;
+        // A physical UP normally goes to Chromium after capture handoff. A
+        // second UP is inert there; it also balances a rare UP lost during a
+        // concurrent window/capture transition.
+        if (ShieldRenderer != IntPtr.Zero && IsWindow(ShieldRenderer))
+            PostMessage(ShieldRenderer, WM_LBUTTONUP, IntPtr.Zero,
+                NativePosition(ShieldRenderer, ShieldLastUp.X, ShieldLastUp.Y));
+        RefreshShield();
+    }
+    private static void EndShieldHover() {
+        IntPtr renderer = ShieldHoverRenderer;
+        ShieldHoverRenderer = IntPtr.Zero;
+        if (ShieldTrackingMouse && ShieldWindow != IntPtr.Zero) {
+            var cancel = new TRACKMOUSEEVENT { Size = Marshal.SizeOf(typeof(TRACKMOUSEEVENT)),
+                Flags = 0x80000002U, Window = ShieldWindow, HoverTime = 0 };
+            TrackMouseEvent(ref cancel);
+        }
+        ShieldTrackingMouse = false;
+        if (renderer != IntPtr.Zero && IsWindow(renderer))
+            PostMessage(renderer, WM_MOUSELEAVE, IntPtr.Zero, IntPtr.Zero);
+    }
+    private static void ForwardShieldHover(IntPtr window, POINT position) {
+        PetTarget target = Volatile.Read(ref CurrentTarget);
+        if (target == null || target.Renderer == IntPtr.Zero ||
+            !IsWindow(target.Renderer) || GetAncestor(target.Renderer, 2) != target.Overlay) return;
+        if (ShieldHoverRenderer != IntPtr.Zero && ShieldHoverRenderer != target.Renderer) EndShieldHover();
+        if (!ShieldTrackingMouse) {
+            var request = new TRACKMOUSEEVENT { Size = Marshal.SizeOf(typeof(TRACKMOUSEEVENT)),
+                Flags = 2, Window = window, HoverTime = 0 };
+            ShieldTrackingMouse = TrackMouseEvent(ref request);
+        }
+        POINT client = position;
+        if (ScreenToClient(target.Renderer, ref client) &&
+            client.X >= Int16.MinValue && client.X <= Int16.MaxValue &&
+            client.Y >= Int16.MinValue && client.Y <= Int16.MaxValue) {
+            ShieldHoverRenderer = target.Renderer;
+            PostMessage(target.Renderer, WM_MOUSEMOVE, IntPtr.Zero,
+                MakeMouseLParam(client.X, client.Y));
+        }
+    }
+    private static bool PetHasCapture() {
+        if (ShieldRenderer == IntPtr.Zero || !IsWindow(ShieldRenderer)) return false;
+        uint processId;
+        uint targetThread = GetWindowThreadProcessId(ShieldRenderer, out processId);
+        GUITHREADINFO info = new GUITHREADINFO { Size = Marshal.SizeOf(typeof(GUITHREADINFO)) };
+        return targetThread != 0 && GetGUIThreadInfo(targetThread, ref info) &&
+            info.Capture != IntPtr.Zero && GetAncestor(info.Capture, 2) == ShieldOverlay;
+    }
+    private static void FinishShieldGesture(int message, POINT end, bool wasDrag) {
+        if (wasDrag) Interlocked.Exchange(ref ShieldRequireTargetAfter, DateTime.UtcNow.Ticks);
+        MouseHookEvents.Enqueue(new MouseHookEventRecord {
+            Message = message, X = end.X, Y = end.Y, UtcTicks = DateTime.UtcNow.Ticks,
+            ForegroundBefore = ShieldForeground, ForegroundAtEvent = GetForegroundWindow().ToInt64(),
+            ForegroundShowStateBefore = ShieldShowState,
+            NativeClickSuppressed = !wasDrag, NativeClickDeflected = !wasDrag,
+            BodyGestureOwned = !wasDrag, BodyDragStarted = wasDrag, NativeDragHandoff = wasDrag
+        });
+        Interlocked.Increment(ref CompletedGestureCount);
+        Interlocked.Exchange(ref SettleUntil, DateTime.UtcNow.AddMilliseconds(80).Ticks);
+        Volatile.Write(ref ShieldState, 0);
+        SetGestureActive(false);
+        if (wasDrag) PositionShieldAfterNativeDrag(); else RefreshShield();
+    }
+    private static IntPtr ShieldCallback(IntPtr window, uint message, IntPtr wParam, IntPtr lParam) {
+        if (message == WM_MOUSEACTIVATE) return new IntPtr(3); // MA_NOACTIVATE
+        if (message == WM_NCHITTEST) return new IntPtr(1); // HTCLIENT
+        if (message == WM_LBUTTONDOWN) {
+            if (Volatile.Read(ref ShieldState) == 4) {
+                SendToPet(WM_LBUTTONUP, ShieldLastUp.X, ShieldLastUp.Y, false);
+                Volatile.Write(ref ShieldState, 0);
+            }
+            PetTarget target = Volatile.Read(ref CurrentTarget);
+            POINT start = new POINT {
+                X = ShieldBounds.Left + unchecked((short)(lParam.ToInt64() & 0xffff)),
+                Y = ShieldBounds.Top + unchecked((short)((lParam.ToInt64() >> 16) & 0xffff))
+            };
+            if (!ShieldVisible || !Contains(ShieldBounds, start)) return IntPtr.Zero;
+            if (target != null)
+                foreach (RECT button in target.Buttons) if (Contains(button, start)) return IntPtr.Zero;
+            IntPtr overlay = target != null ? target.Overlay : ShieldPlacedOverlay;
+            if (overlay == IntPtr.Zero || !IsWindowVisible(overlay)) return IntPtr.Zero;
+            bool nativeTargetReady = target != null && DateTime.UtcNow.Ticks <= target.ExpiresAt &&
+                SameRect(target.Body, ShieldBounds) && target.Renderer != IntPtr.Zero &&
+                IsWindow(target.Renderer) && GetAncestor(target.Renderer, 2) == target.Overlay;
+            EndShieldHover();
+            ShieldStart = start;
+            ShieldDragThresholdPhysical = PhysicalDragThreshold(overlay);
+            ShieldBodyBoundsAtDown = ShieldBounds;
+            ShieldOverlay = overlay;
+            ShieldRenderer = nativeTargetReady ? target.Renderer : IntPtr.Zero;
+            if (!GetWindowRect(overlay, out ShieldOverlayBoundsAtDown))
+                ShieldOverlayBoundsAtDown = new RECT();
+            ShieldForeground = GetForegroundWindow().ToInt64();
+            ShieldShowState = ShieldForeground == 0 ? 0 : IsIconic(new IntPtr(ShieldForeground)) ? 2 : IsZoomed(new IntPtr(ShieldForeground)) ? 3 : 1;
+            SetCapture(window);
+            Volatile.Write(ref ShieldState, 1);
+            SetGestureActive(true);
+            return IntPtr.Zero;
+        }
+        if (message == WM_RBUTTONDOWN || message == WM_RBUTTONUP) {
+            PetTarget target = Volatile.Read(ref CurrentTarget);
+            if (target != null && target.Renderer != IntPtr.Zero && IsWindow(target.Renderer) &&
+                GetAncestor(target.Renderer, 2) == target.Overlay) {
+                ShieldOverlay = target.Overlay;
+                ShieldRenderer = target.Renderer;
+                int x = ShieldBounds.Left + unchecked((short)(lParam.ToInt64() & 0xffff));
+                int y = ShieldBounds.Top + unchecked((short)((lParam.ToInt64() >> 16) & 0xffff));
+                SendToPetRaw(message, x, y,
+                    message == WM_RBUTTONDOWN ? new IntPtr(2) : IntPtr.Zero);
+            }
+            return IntPtr.Zero;
+        }
+        if (message == WM_CONTEXTMENU) return IntPtr.Zero;
+        if (message == WM_MOUSEMOVE && Volatile.Read(ref ShieldState) == 1) {
+            POINT current = new POINT {
+                X = ShieldBounds.Left + unchecked((short)(lParam.ToInt64() & 0xffff)),
+                Y = ShieldBounds.Top + unchecked((short)((lParam.ToInt64() >> 16) & 0xffff))
+            };
+            if (Math.Abs(current.X - ShieldStart.X) >= ShieldDragThresholdPhysical ||
+                Math.Abs(current.Y - ShieldStart.Y) >= ShieldDragThresholdPhysical) {
+                if (!PhysicalLeftHeld() || !IsWindow(ShieldOverlay) || !IsWindow(ShieldRenderer)) {
+                    ShieldLastResult = "released-before-handoff";
+                    Volatile.Write(ref ShieldState, 3);
+                    return IntPtr.Zero;
+                }
+                ShieldSendingHandoff = true;
+                bool downSent = SendToPet(WM_LBUTTONDOWN, ShieldStart.X, ShieldStart.Y, true);
+                bool moveSent = downSent && SendToPet(WM_MOUSEMOVE, current.X, current.Y, true);
+                bool captured = downSent && moveSent && PetHasCapture();
+                ShieldSendingHandoff = false;
+                if (captured) {
+                    GestureStart = ShieldStart;
+                    GestureForeground = ShieldForeground;
+                    GestureShowState = ShieldShowState;
+                    GestureIsButton = false;
+                    GestureDragging = true;
+                    long initialPoint = PackPoint(current);
+                    Interlocked.Exchange(ref LatestDragPointPacked, initialPoint);
+                    Interlocked.Exchange(ref LastRelayedDragPointPacked, initialPoint);
+                    Volatile.Write(ref ShieldState, 2);
+                    Interlocked.Increment(ref ShieldNativeDrags);
+                    ShieldLastResult = "native-capture";
+                    SetNativePointerAccess(ShieldOverlay, true, true);
+                    if (GetCapture() == window) ReleaseCapture();
+                    HideShieldOnThread();
+                    if (SetTimer(window, new UIntPtr(2), 16, IntPtr.Zero) == UIntPtr.Zero)
+                        ShieldError = "SetTimer drag relay: " + Marshal.GetLastWin32Error();
+                } else {
+                    Interlocked.Increment(ref ShieldHandoffFailures);
+                    ShieldLastResult = downSent ? "native-handoff-cleanup" : "native-down-failed";
+                    if (downSent) {
+                        // Keep the cleanup MOVE and UP at one displaced point.
+                        // Returning to origin can coalesce away the move and
+                        // turn this exceptional path into a native click.
+                        int cleanupX = ShieldStart.X + ShieldDragThresholdPhysical + 1;
+                        int cleanupY = ShieldStart.Y + ShieldDragThresholdPhysical + 1;
+                        if (!SendToPet(WM_MOUSEMOVE, cleanupX, cleanupY, true))
+                            PostMessage(ShieldRenderer, WM_MOUSEMOVE, new IntPtr(1), NativePosition(ShieldRenderer, cleanupX, cleanupY));
+                        if (!SendToPet(WM_LBUTTONUP, cleanupX, cleanupY, false))
+                            PostMessage(ShieldRenderer, WM_LBUTTONUP, IntPtr.Zero, NativePosition(ShieldRenderer, cleanupX, cleanupY));
+                    }
+                    Volatile.Write(ref ShieldState, 3); // wait for real shield UP
+                }
+            }
+            return IntPtr.Zero;
+        }
+        if (message == WM_MOUSEMOVE && Volatile.Read(ref ShieldState) == 0) {
+            POINT current = new POINT {
+                X = ShieldBounds.Left + unchecked((short)(lParam.ToInt64() & 0xffff)),
+                Y = ShieldBounds.Top + unchecked((short)((lParam.ToInt64() >> 16) & 0xffff))
+            };
+            ForwardShieldHover(window, current);
+            return IntPtr.Zero;
+        }
+        if (message == WM_MOUSELEAVE) { EndShieldHover(); return IntPtr.Zero; }
+        if (message == WM_TIMER && wParam == new IntPtr(1)) {
+            KillTimer(window, new UIntPtr(1));
+            FinishNativeUpAfterTimer();
+            return IntPtr.Zero;
+        }
+        if (message == WM_TIMER && wParam == new IntPtr(2)) {
+            if (Volatile.Read(ref ShieldState) == 2) ForwardLatestDragMove();
+            else KillTimer(window, new UIntPtr(2));
+            return IntPtr.Zero;
+        }
+        if (message == WM_LBUTTONUP) {
+            int state = Volatile.Read(ref ShieldState);
+            POINT end = new POINT {
+                X = ShieldBounds.Left + unchecked((short)(lParam.ToInt64() & 0xffff)),
+                Y = ShieldBounds.Top + unchecked((short)((lParam.ToInt64() >> 16) & 0xffff))
+            };
+            if (state == 2 || state == 4) {
+                if (state == 2) ShieldLastUp = end;
+                else end = ShieldLastUp; // actual screen point from the low-level physical UP
+                if (!SendToPet(WM_LBUTTONUP, end.X, end.Y, false) &&
+                    ShieldRenderer != IntPtr.Zero && IsWindow(ShieldRenderer))
+                    PostMessage(ShieldRenderer, WM_LBUTTONUP, IntPtr.Zero,
+                        NativePosition(ShieldRenderer, end.X, end.Y));
+                if (state == 2) FinishShieldGesture(WM_LBUTTONUP, end, true);
+                else { Volatile.Write(ref ShieldState, 0); PositionShieldAfterNativeDrag(); }
+            } else if (state == 1) {
+                Interlocked.Increment(ref ShieldClicks);
+                FinishShieldGesture(WM_LBUTTONUP, end, false);
+            } else if (state == 3) {
+                Volatile.Write(ref ShieldState, 0); SetGestureActive(false); RefreshShield();
+            }
+            if (GetCapture() == window) ReleaseCapture();
+            return IntPtr.Zero;
+        }
+        if (message == WM_CAPTURECHANGED) {
+            if (Volatile.Read(ref ShieldState) == 1 && !ShieldSendingHandoff) {
+                ShieldLastResult = "shield-capture-lost";
+                Volatile.Write(ref ShieldState, 0);
+                SetGestureActive(false);
+                RefreshShield();
+            }
+            return IntPtr.Zero;
+        }
+        if (message == WM_CLOSE) { DestroyWindow(window); return IntPtr.Zero; }
+        if (message == WM_DESTROY) { PostQuitMessage(0); return IntPtr.Zero; }
+        return DefWindowProc(window, message, wParam, lParam);
+    }
+    private static IntPtr NativePosition(IntPtr renderer, int x, int y) {
+        POINT client = new POINT { X = x, Y = y };
+        if (!ScreenToClient(renderer, ref client)) return IntPtr.Zero;
+        return MakeMouseLParam(client.X, client.Y);
+    }
 
-    // Observe actual input. Never swallow or synthesize DOWN, MOVE, or UP.
-    // Chromium and Windows retain a single consistent button/capture state.
+
+    // Observe physical input without consuming it. A body click is owned by
+    // the separate shield window; after a verified drag handoff the native
+    // renderer receives the rest of the physical gesture directly.
     public static bool ProcessPointer(int message, POINT point, uint flags) {
         if ((flags & 1U) != 0) return false;
         if (message != WM_LBUTTONDOWN && message != WM_LBUTTONUP && message != WM_MOUSEMOVE) return false;
+        int shieldState = Volatile.Read(ref ShieldState);
+        if (shieldState == 1 || shieldState == 3) return false;
+        if ((shieldState == 0 || shieldState == 4) && message == WM_LBUTTONDOWN && ShieldWindow != IntPtr.Zero &&
+            WindowFromPoint(point) == ShieldWindow) return false;
         if (message == WM_MOUSEMOVE && !IsGestureActive()) {
             UpdateNativePointerAccess(point, false);
             return false;
@@ -396,7 +1010,11 @@ public static class ProfessorCluckshotInputNative
             return false;
         }
         bool justStarted = false;
-        if (message == WM_MOUSEMOVE) Interlocked.Increment(ref InputMoveCount);
+        if (message == WM_MOUSEMOVE) {
+            Interlocked.Increment(ref InputMoveCount);
+            if (shieldState == 2)
+                Interlocked.Exchange(ref LatestDragPointPacked, PackPoint(point));
+        }
         if (message != WM_LBUTTONDOWN) {
             long dx = (long)point.X - GestureStart.X, dy = (long)point.Y - GestureStart.Y;
             if (!GestureIsButton && !GestureDragging && dx * dx + dy * dy >= BODY_DRAG_THRESHOLD_SQUARED) {
@@ -416,6 +1034,17 @@ public static class ProfessorCluckshotInputNative
         if (message == WM_LBUTTONUP) {
             Interlocked.Increment(ref CompletedGestureCount);
             Interlocked.Exchange(ref SettleUntil, DateTime.UtcNow.AddMilliseconds(80).Ticks);
+            if (shieldState == 2) {
+                Interlocked.Exchange(ref LatestDragPointPacked, PackPoint(point));
+                QueueFinalDragMove(point);
+                ShieldLastUp = point;
+                Interlocked.Exchange(ref ShieldRequireTargetAfter, DateTime.UtcNow.Ticks);
+                Interlocked.Exchange(ref ShieldReleaseDeadline, DateTime.UtcNow.AddMilliseconds(250).Ticks);
+                Volatile.Write(ref ShieldState, 4);
+                uint shieldThread = ShieldThreadId;
+                if (shieldThread != 0)
+                    PostThreadMessage(shieldThread, WM_SHIELD_FINISH_UP, UIntPtr.Zero, IntPtr.Zero);
+            }
             SetGestureActive(false);
         }
         return false;
@@ -1051,6 +1680,7 @@ if ($ProbeOnly) {
 $mutex = New-Object Threading.Mutex($false, 'Local\ProfessorCluckshotCodexPetInputBridge')
 $ownsMutex = $false
 $mouseHookStarted = $false
+$shieldStarted = $false
 try {
     try { $ownsMutex = $mutex.WaitOne(0) } catch [Threading.AbandonedMutexException] { $ownsMutex = $true }
     if (-not $ownsMutex) { exit 0 }
@@ -1068,13 +1698,16 @@ try {
     $script:pointerEvents = @()
     $script:lastOverlayPointer = $null
     $mouseHookStarted = [ProfessorCluckshotInputNative]::StartMouseHook()
-    $script:pointerCaptureMode = if ($mouseHookStarted) { 'native-physical-input' } else { 'unavailable' }
+    if ($mouseHookStarted) { $shieldStarted = [ProfessorCluckshotInputNative]::StartClickShield() }
+    $script:pointerCaptureMode = if ($mouseHookStarted -and $shieldStarted) { 'click-shield-native-drag' } else { 'unavailable' }
     $script:pointerHookError = [ProfessorCluckshotInputNative]::GetMouseHookLastError()
     [void](Write-PointerEventFile)
     if (-not $mouseHookStarted) { throw "Input hook unavailable: $script:pointerHookError" }
+    if (-not $shieldStarted) { throw "Click shield unavailable: $([ProfessorCluckshotInputNative]::GetClickShieldError())" }
 
     while ($true) {
         $now = [DateTime]::UtcNow
+        [ProfessorCluckshotInputNative]::ReconcileShieldRelease()
         # Drain complete gestures before refreshing a possibly replaced native HWND.
         foreach ($event in @([ProfessorCluckshotInputNative]::DrainMouseHookEvents())) {
             $eventAt = [DateTime]::new([long]$event.UtcTicks, [DateTimeKind]::Utc)
@@ -1132,6 +1765,7 @@ try {
         }
         if (($now - $lastHeartbeat).TotalSeconds -ge 1) {
             if (-not [ProfessorCluckshotInputNative]::IsMouseHookActive()) { throw 'Input hook stopped' }
+            if (-not [ProfessorCluckshotInputNative]::IsClickShieldActive()) { throw "Click shield stopped: $([ProfessorCluckshotInputNative]::GetClickShieldError())" }
             [void](Write-PointerEventFile)
             $lastHeartbeat = $now
         }
@@ -1144,6 +1778,7 @@ try {
     throw
 } finally {
     [ProfessorCluckshotInputNative]::ClearPetBodyClickGuard()
+    if ($shieldStarted) { [ProfessorCluckshotInputNative]::StopClickShield() }
     if ($mouseHookStarted) { [ProfessorCluckshotInputNative]::StopMouseHook() }
     if ($ownsMutex) { $mutex.ReleaseMutex() }
     $mutex.Dispose()
