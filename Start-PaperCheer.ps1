@@ -109,6 +109,10 @@ function Start-Sidecar {
     $arguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass')
     if ($Sta) {
         $arguments += '-STA'
+    } else {
+        # UI Automation polling has no dispatcher on this thread. Use MTA;
+        # only the WPF speech overlay needs STA and its dispatcher loop.
+        $arguments += '-MTA'
     }
     $arguments += @('-File', ('"{0}"' -f $ScriptPath))
     $arguments += $ExtraArguments

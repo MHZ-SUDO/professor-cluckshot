@@ -351,6 +351,9 @@ public static class ProfessorCluckshotInputNative
         public long PublishedAt, ExpiresAt;
     }
     private static PetTarget CurrentTarget;
+    private static PetTarget ShieldRegionTarget;
+    private static IntPtr ShieldRegionWindow;
+    private static long ShieldRegionUpdates;
     private static bool GestureIsButton;
     private static bool GestureDragging;
     private static POINT GestureStart;
@@ -379,6 +382,7 @@ public static class ProfessorCluckshotInputNative
         public int ShieldLastSendError { get; set; }
         public string ShieldLastResult { get; set; }
         public bool ShieldVisible { get; set; }
+        public long ShieldRegionUpdates { get; set; }
     }
     public static RelayDiagnostics GetRelayDiagnostics() {
         return new RelayDiagnostics { InputMoves = Interlocked.Read(ref InputMoveCount),
@@ -389,7 +393,7 @@ public static class ProfessorCluckshotInputNative
             ShieldHandoffFailures = Interlocked.Read(ref ShieldHandoffFailures),
             ShieldLastSendError = Volatile.Read(ref ShieldLastSendError),
             ShieldLastResult = ShieldLastResult,
-            ShieldVisible = ShieldVisible };
+            ShieldVisible = ShieldVisible, ShieldRegionUpdates = Interlocked.Read(ref ShieldRegionUpdates) };
     }
     public static bool IsInteractionBusy() {
         return IsGestureActive() || Volatile.Read(ref ShieldState) == 4 ||
@@ -534,6 +538,8 @@ public static class ProfessorCluckshotInputNative
         } catch (Exception error) {
             ShieldError = error.ToString(); ShieldReady.Set();
         } finally {
+            ShieldRegionTarget = null;
+            ShieldRegionWindow = IntPtr.Zero;
             ShieldWindow = IntPtr.Zero;
             ShieldVisible = false;
             ShieldThreadId = 0;
@@ -553,6 +559,26 @@ public static class ProfessorCluckshotInputNative
     private static void ApplyShieldRegion(PetTarget target) {
         int width = target.Body.Right - target.Body.Left;
         int height = target.Body.Bottom - target.Body.Top;
+        PetTarget previous = ShieldRegionTarget;
+        bool same = previous != null && ShieldRegionWindow == ShieldWindow &&
+            width == previous.Body.Right - previous.Body.Left &&
+            height == previous.Body.Bottom - previous.Body.Top &&
+            target.Buttons.Length == previous.Buttons.Length;
+        if (same) {
+            for (int i = 0; i < target.Buttons.Length; i++) {
+                RECT a = target.Buttons[i], b = previous.Buttons[i];
+                if (a.Left - target.Body.Left != b.Left - previous.Body.Left ||
+                    a.Right - target.Body.Left != b.Right - previous.Body.Left ||
+                    a.Top - target.Body.Top != b.Top - previous.Body.Top ||
+                    a.Bottom - target.Body.Top != b.Bottom - previous.Body.Top) {
+                    same = false;
+                    break;
+                }
+            }
+        }
+        // The region is local to the window. Moving the same shape needs no
+        // new HRGN or layered-window invalidation on every accessibility poll.
+        if (same) return;
         IntPtr region = CreateRectRgn(0, 0, width, height);
         if (region == IntPtr.Zero) return;
         foreach (RECT button in target.Buttons) {
@@ -564,7 +590,14 @@ public static class ProfessorCluckshotInputNative
                 DeleteObject(exclusion);
             }
         }
-        if (SetWindowRgn(ShieldWindow, region, false) == 0) DeleteObject(region);
+        if (SetWindowRgn(ShieldWindow, region, false) == 0) {
+            DeleteObject(region);
+        } else {
+            // Ownership of the successful region has transferred to Windows.
+            ShieldRegionTarget = target;
+            ShieldRegionWindow = ShieldWindow;
+            Interlocked.Increment(ref ShieldRegionUpdates);
+        }
     }
     private static void RefreshShieldOnThread() {
         if (ShieldWindow == IntPtr.Zero || Volatile.Read(ref ShieldState) != 0) return;
@@ -1246,6 +1279,27 @@ public static class ProfessorCluckshotInputNative
 
 Add-Type -TypeDefinition $source
 [void][ProfessorCluckshotInputNative]::EnablePerMonitorV2ForCurrentThread()
+$script:petAutomationRoot = $null
+$script:petAutomationRootOverlay = [IntPtr]::Zero
+$script:petAutomationCache = [System.Windows.Automation.CacheRequest]::new()
+$script:petAutomationCache.AutomationElementMode = [System.Windows.Automation.AutomationElementMode]::None
+$script:petAutomationCache.TreeScope = [System.Windows.Automation.TreeScope]::Element
+foreach ($property in @(
+    [System.Windows.Automation.AutomationElement]::IsOffscreenProperty,
+    [System.Windows.Automation.AutomationElement]::BoundingRectangleProperty,
+    [System.Windows.Automation.AutomationElement]::NameProperty,
+    [System.Windows.Automation.AutomationElement]::ClassNameProperty,
+    [System.Windows.Automation.AutomationElement]::ControlTypeProperty
+)) { $script:petAutomationCache.Add($property) }
+$script:petAutomationCondition = [System.Windows.Automation.OrCondition]::new(
+    [System.Windows.Automation.Condition[]]@(
+        [System.Windows.Automation.PropertyCondition]::new(
+            [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+            [System.Windows.Automation.ControlType]::Image),
+        [System.Windows.Automation.PropertyCondition]::new(
+            [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+            [System.Windows.Automation.ControlType]::Button)
+    ))
 $script:petAutomationLayout = $null
 
 if ($HookProbe) {
@@ -1274,21 +1328,30 @@ function Get-PetAutomationLayout {
     }
 
     try {
-        $root = [System.Windows.Automation.AutomationElement]::FromHandle($Overlay)
+        if ($null -eq $script:petAutomationRoot -or $script:petAutomationRootOverlay -ne $Overlay) {
+            $script:petAutomationRoot = [System.Windows.Automation.AutomationElement]::FromHandle($Overlay)
+            $script:petAutomationRootOverlay = $Overlay
+        }
+        $root = $script:petAutomationRoot
         if ($null -eq $root) {
             return $null
         }
 
-        $elements = $root.FindAll(
-            [System.Windows.Automation.TreeScope]::Descendants,
-            [System.Windows.Automation.Condition]::TrueCondition
-        )
+        # Fetch only the two control types and five properties we need, in one
+        # cache request. Returned nodes are snapshots, not live UIA references.
+        $cacheScope = $script:petAutomationCache.Activate()
+        try {
+            $elements = $root.FindAll(
+                [System.Windows.Automation.TreeScope]::Descendants,
+                $script:petAutomationCondition
+            )
+        } finally { $cacheScope.Dispose() }
         $preferredMascots = @()
         $fallbackMascots = @()
         $buttons = @()
         for ($index = 0; $index -lt $elements.Count; $index++) {
             try {
-                $current = $elements.Item($index).Current
+                $current = $elements.Item($index).Cached
                 if ($current.IsOffscreen) {
                     continue
                 }
@@ -1344,6 +1407,8 @@ function Get-PetAutomationLayout {
         }
     }
     catch {
+        $script:petAutomationRoot = $null
+        $script:petAutomationRootOverlay = [IntPtr]::Zero
         return $null
     }
 }
@@ -1574,6 +1639,7 @@ function Write-PointerEventFile {
         processId = $PID
         sessionId = $script:pointerEventSession
         captureMode = $script:pointerCaptureMode
+        apartmentState = [Threading.Thread]::CurrentThread.GetApartmentState().ToString()
         updatedAt = [DateTime]::UtcNow.ToString('o')
         gestureActive = [ProfessorCluckshotInputNative]::IsInteractionBusy()
         relayDiagnostics = [ProfessorCluckshotInputNative]::GetRelayDiagnostics()
@@ -1677,6 +1743,9 @@ if ($ProbeOnly) {
     exit 0
 }
 
+if ([Threading.Thread]::CurrentThread.GetApartmentState() -ne [Threading.ApartmentState]::MTA) {
+    throw 'The input bridge requires PowerShell -MTA. Run Start-PaperCheer.ps1.'
+}
 $mutex = New-Object Threading.Mutex($false, 'Local\ProfessorCluckshotCodexPetInputBridge')
 $ownsMutex = $false
 $mouseHookStarted = $false

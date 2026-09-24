@@ -33,6 +33,19 @@ Add-Type -AssemblyName PresentationFramework
 Add-Type -AssemblyName WindowsBase
 Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
+$script:visualAutomationRoot = $null
+$script:visualAutomationWindow = [IntPtr]::Zero
+$script:visualAutomationCache = [System.Windows.Automation.CacheRequest]::new()
+$script:visualAutomationCache.AutomationElementMode = [System.Windows.Automation.AutomationElementMode]::None
+$script:visualAutomationCache.TreeScope = [System.Windows.Automation.TreeScope]::Element
+foreach ($property in @(
+    [System.Windows.Automation.AutomationElement]::IsOffscreenProperty,
+    [System.Windows.Automation.AutomationElement]::BoundingRectangleProperty,
+    [System.Windows.Automation.AutomationElement]::ClassNameProperty
+)) { $script:visualAutomationCache.Add($property) }
+$script:visualImageCondition = [System.Windows.Automation.PropertyCondition]::new(
+    [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+    [System.Windows.Automation.ControlType]::Image)
 
 if (-not ('PaperCheer.NativeWindow' -as [type])) {
     Add-Type -TypeDefinition @'
@@ -806,23 +819,26 @@ function Get-PetVisualBounds {
         return $null
     }
     try {
-        $root = [System.Windows.Automation.AutomationElement]::FromHandle($PetWindow)
+        if ($null -eq $script:visualAutomationRoot -or $script:visualAutomationWindow -ne $PetWindow) {
+            $script:visualAutomationRoot = [System.Windows.Automation.AutomationElement]::FromHandle($PetWindow)
+            $script:visualAutomationWindow = $PetWindow
+        }
+        $root = $script:visualAutomationRoot
         if ($null -eq $root) {
             return $null
         }
-        $imageCondition = New-Object System.Windows.Automation.PropertyCondition(
-            [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
-            [System.Windows.Automation.ControlType]::Image
-        )
-        $images = $root.FindAll(
-            [System.Windows.Automation.TreeScope]::Descendants,
-            $imageCondition
-        )
+        $cacheScope = $script:visualAutomationCache.Activate()
+        try {
+            $images = $root.FindAll(
+                [System.Windows.Automation.TreeScope]::Descendants,
+                $script:visualImageCondition
+            )
+        } finally { $cacheScope.Dispose() }
         $preferred = @()
         $fallback = @()
         for ($index = 0; $index -lt $images.Count; $index++) {
             try {
-                $current = $images.Item($index).Current
+                $current = $images.Item($index).Cached
                 if ($current.IsOffscreen) {
                     continue
                 }
@@ -861,6 +877,8 @@ function Get-PetVisualBounds {
         $rect.Bottom = $mascot[0].bottom
         return $rect
     } catch {
+        $script:visualAutomationRoot = $null
+        $script:visualAutomationWindow = [IntPtr]::Zero
         return $null
     }
 }
@@ -1203,6 +1221,7 @@ function Ensure-InputBridgeRunning {
     try {
         $arguments = @(
             '-NoProfile',
+            '-MTA',
             '-ExecutionPolicy', 'Bypass',
             '-File', ('"{0}"' -f $inputBridgeScript)
         )
