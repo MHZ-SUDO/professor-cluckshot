@@ -4,19 +4,19 @@
 
 ## 中文简介
 
-Professor Cluckshot（鸡哥）是 Codex 桌面端的论文鼓励宠物。它包含完整的 Codex v2 动画、中文随机台词、点击/悬停/拖动反馈，以及 Windows 下的圆形按钮点击修复。
+Professor Cluckshot（鸡哥）是 Codex 桌面端的陪伴宠物。它包含完整的 Codex v2 动画、中文随机台词、点击/悬停/拖动反馈，以及 Windows 下的圆形按钮点击修复。
 
 <details>
 <summary>English introduction</summary>
 
-Professor Cluckshot is a basketball-loving research chicken for the Codex desktop app, with a v2 animation atlas, conversational Chinese thesis encouragement, and Windows runtime helpers.
+Professor Cluckshot is a basketball-loving companion for the Codex desktop app, with a v2 animation atlas, a varied collection of Chinese dialogue, and Windows runtime helpers.
 
 </details>
 
 ## 功能
 
 - Codex v2 宠物包：8 × 11、1536 × 2288、RGBA WebP
-- 丰富的中文固定台词和超过 52,000 种动态组合
+- 3,305 条中文台词，涵盖人生感悟、哲理、励志、幽默、温柔陪伴、淡淡惆怅、中外诗句和网络常见语
 - 默认每 3–7 分钟随机说话
 - 点击、悬停和拖动反馈
 - 单击鸡哥触发说话；本地点击接收层避免把单击交给 Codex 主窗口
@@ -34,6 +34,8 @@ Professor Cluckshot is a basketball-loving research chicken for the Codex deskto
 输入助手在鸡哥人物区域放置一个几乎不可见、不会激活的点击接收层。单击由它触发说话；拖拽越过阈值时，助手向鸡哥原生窗口交付按下和移动，随后按约 16 毫秒间隔转发最新鼠标位置，让后台窗口也能连续跟随。按钮区域保持原有点击方式。遇到覆盖鸡哥的截图选区等窗口，接收层会避让；助手不修改 Codex 安装文件。
 
 ## 当前版本：1.2.31
+
+2026-10-26 更新台词库：保留古诗词原句，增加外国诗与哲理短句的中文自译或节译，并关闭旧的自动拼句。每条台词可以单独表达一种风格，也可以自然混合。可直接查看 [分类浏览版](鸡哥词库_分类浏览.txt)；作品作者、来源和译文说明保存在 `paper-cheer-dialogue.json` 的 `source` 字段中。
 
 1.2.31 修正后台监听的线程模式及自动恢复参数，改进界面读取，并减少相同点击区域的重复重建，处理长时间运行时的内存增长。单击说话、拖动跟随和独立按钮的行为保持不变，运行助手仍保持独立后台启动。
 
@@ -75,6 +77,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\Install-ProfessorCluckshot
 ## 更新
 
 在仓库目录更新后重新运行安装器即可；安装器会先安全停止旧助手，再覆盖运行文件并重新启动：
+
+仓库当前的助手版本为 1.2.31。如果本机安装了更新的助手版本，重新运行本仓库安装器会覆盖该版本；只更新台词时，可先备份并替换已安装目录中的 `paper-cheer-dialogue.json`，然后重启说话助手。
 
 ```powershell
 git pull
@@ -142,7 +146,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $petPath 'Uninsta
 - `Get-PaperCheerStatus.ps1`：只读状态诊断
 - `Uninstall-ProfessorCluckshot.ps1`：停止、取消自启动和卸载
 - `Start-PaperCheer.ps1` / `Stop-PaperCheer.ps1`：运行控制
-- `paper-cheer-dialogue.json`：固定台词和动态模板
+- `paper-cheer-dialogue.json`：分类台词及部分作品的来源记录
+- `鸡哥词库_分类浏览.txt`：按风格整理的台词浏览版
 
 ## 说明
 
@@ -152,4 +157,4 @@ Codex 原生读取 `pet.json` 和 `spritesheet.webp`。说话与 Windows 点击�
 
 ## License
 
-代码、台词和文档使用 MIT License。角色图像不包含在 MIT 授权中；重用或再分发精灵图前请阅读 [ASSET_NOTICE.md](ASSET_NOTICE.md)。
+代码和本项目原创内容使用 MIT License。引用的古诗、外国作品及网络短句的来源见台词库记录，相关原作或引用内容的权利应分别确认。角色图像不包含在 MIT 授权中；重用或再分发精灵图前请阅读 [ASSET_NOTICE.md](ASSET_NOTICE.md)。
